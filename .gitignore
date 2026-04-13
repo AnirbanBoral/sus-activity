@@ -1,0 +1,21 @@
+# Environments
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+
+# Datasets and Media
+archive.zip
+src/data/
+src/manual_test/
+
+# Large Model Weights
+*.pt
+simple_cnn_model.h5
+
+# Local logs
+*.log

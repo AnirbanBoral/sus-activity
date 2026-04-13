@@ -1,0 +1,22 @@
+=== SIMPLE CNN PERFORMANCE ===
+Total Samples Trained On: 8000
+Total Samples Tested On: 2000
+Final Test Accuracy: 89.20%
+Final Test Loss: 0.2642
+
+Epoch History (Training vs Validation Accuracy):
+Epoch 1: Train Acc = 64.25%, Val Acc = 50.00%
+Epoch 2: Train Acc = 71.32%, Val Acc = 50.85%
+Epoch 3: Train Acc = 75.35%, Val Acc = 54.25%
+Epoch 4: Train Acc = 78.55%, Val Acc = 76.15%
+Epoch 5: Train Acc = 80.37%, Val Acc = 75.75%
+Epoch 6: Train Acc = 82.70%, Val Acc = 74.25%
+Epoch 7: Train Acc = 82.76%, Val Acc = 85.40%
+Epoch 8: Train Acc = 84.00%, Val Acc = 87.70%
+Epoch 9: Train Acc = 84.36%, Val Acc = 87.95%
+Epoch 10: Train Acc = 86.05%, Val Acc = 85.10%
+Epoch 11: Train Acc = 86.73%, Val Acc = 87.90%
+Epoch 12: Train Acc = 86.99%, Val Acc = 88.65%
+Epoch 13: Train Acc = 87.01%, Val Acc = 88.80%
+Epoch 14: Train Acc = 87.61%, Val Acc = 89.20%
+Epoch 15: Train Acc = 89.06%, Val Acc = 86.05%

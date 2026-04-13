@@ -1,0 +1,36 @@
+Exploratory Data Analysis Report
+================================
+
+Total Suspicious Images: 364933
+Total Normal Images: 1012720
+Total Images Overall: 1377653
+
+Breakdown by Category:
+  - Suspicious: Test_Abuse: 297 images
+  - Suspicious: Test_Arrest: 3365 images
+  - Suspicious: Test_Arson: 2793 images
+  - Suspicious: Test_Assault: 2657 images
+  - Suspicious: Test_Burglary: 7657 images
+  - Suspicious: Test_Explosion: 6510 images
+  - Suspicious: Test_Fighting: 1231 images
+  - Suspicious: Test_RoadAccidents: 2663 images
+  - Suspicious: Test_Robbery: 835 images
+  - Suspicious: Test_Shooting: 7630 images
+  - Suspicious: Test_Shoplifting: 7623 images
+  - Suspicious: Test_Stealing: 1984 images
+  - Suspicious: Test_Vandalism: 1111 images
+  - Suspicious: Train_Abuse: 19076 images
+  - Suspicious: Train_Arrest: 26397 images
+  - Suspicious: Train_Arson: 24421 images
+  - Suspicious: Train_Assault: 10360 images
+  - Suspicious: Train_Burglary: 39504 images
+  - Suspicious: Train_Explosion: 18753 images
+  - Suspicious: Train_Fighting: 24684 images
+  - Suspicious: Train_RoadAccidents: 23486 images
+  - Suspicious: Train_Robbery: 41493 images
+  - Suspicious: Train_Shooting: 7140 images
+  - Suspicious: Train_Shoplifting: 24835 images
+  - Suspicious: Train_Stealing: 44802 images
+  - Suspicious: Train_Vandalism: 13626 images
+  - Normal: Test_NormalVideos: 64952 images
+  - Normal: Train_NormalVideos: 947768 images
