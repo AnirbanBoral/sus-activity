@@ -42,11 +42,12 @@ POSE_MODEL  = os.path.join(SCRIPT_DIR, 'pose_landmarker_lite.task')
 IMAGE_HEIGHT, IMAGE_WIDTH = 128, 128
 SEQUENCE_LENGTH = 12
 
-# Pose rule thresholds (normalized 0–1, relative to person crop)
-RAISED_ARM_THRESH = 0.10
-LUNGE_THRESH      = 0.18
-STRIKE_THRESH     = 0.05
-LEAN_THRESH       = 0.22
+# Pose rule thresholds (tuned to reduce false positives)
+RAISED_ARM_THRESH = 0.22   # wrist must be well above shoulder (was 0.10)
+LUNGE_THRESH      = 0.28   # dramatic hip shift only (was 0.18)
+STRIKE_THRESH     = 0.10   # knee clearly above hip (was 0.05)
+LEAN_THRESH       = 0.30   # aggressive lean only (was 0.22)
+RULE_CONFIRM_N    = 3      # rule must fire this many consecutive checks to display
 
 # Landmark indices
 IDX_NOSE       = 0
@@ -172,6 +173,7 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev):
 
     lm = result.pose_landmarks[0]   # first (and only) person in the crop
 
+    # Landmark indices
     nose      = lm[IDX_NOSE]
     l_sho     = lm[IDX_L_SHOULDER]; r_sho  = lm[IDX_R_SHOULDER]
     l_wrist   = lm[IDX_L_WRIST];    r_wrist = lm[IDX_R_WRIST]
@@ -182,31 +184,33 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev):
     hip_y      = (l_hip.y + r_hip.y) / 2
     hip_x      = (l_hip.x + r_hip.x) / 2
 
-    rule_flag = None
+    raw_flag = None
 
-    # Rule 1 — Raised arms
-    if l_wrist.y < shoulder_y - RAISED_ARM_THRESH or r_wrist.y < shoulder_y - RAISED_ARM_THRESH:
-        rule_flag = "RAISED ARMS"
+    # Rule 1 — Raised arms (both wrists well above shoulder)
+    both_raised = (l_wrist.y < shoulder_y - RAISED_ARM_THRESH and
+                   r_wrist.y < shoulder_y - RAISED_ARM_THRESH)
+    if both_raised:
+        raw_flag = "RAISED ARMS"
 
     # Rule 2 — Striking / kicking posture
-    if not rule_flag:
+    if not raw_flag:
         if l_knee.y < hip_y - STRIKE_THRESH or r_knee.y < hip_y - STRIKE_THRESH:
-            rule_flag = "STRIKING POSTURE"
+            raw_flag = "STRIKING POSTURE"
 
     # Rule 3 — Aggressive forward lean
-    if not rule_flag:
+    if not raw_flag:
         if abs(nose.x - hip_x) > LEAN_THRESH:
-            rule_flag = "AGGRESSIVE LEAN"
+            raw_flag = "AGGRESSIVE LEAN"
 
     # Rule 4 — Lunge (large lateral hip shift between frames)
-    if not rule_flag and track_id in track_pose_prev:
+    if not raw_flag and track_id in track_pose_prev:
         if abs(hip_x - track_pose_prev[track_id]) > LUNGE_THRESH:
-            rule_flag = "LUNGE DETECTED"
+            raw_flag = "LUNGE DETECTED"
 
     track_pose_prev[track_id] = hip_x
 
     annotated = _draw_skeleton(crop_bgr, lm)
-    return rule_flag, annotated
+    return raw_flag, annotated
 
 
 # =============================================================================
@@ -218,11 +222,12 @@ def show_video(video_source):
         print(f"[ERROR] Could not open {video_source}")
         return
 
-    track_buffers   = {}
-    track_status    = {}
-    track_scores    = {}
-    track_pose_prev = {}
-    track_rule_flag = {}
+    track_buffers       = {}
+    track_status        = {}
+    track_scores        = {}
+    track_pose_prev     = {}
+    track_rule_flag     = {}   # confirmed rule flag
+    track_rule_history  = {}   # deque of recent raw flags for temporal smoothing
 
     alert_sent  = False
     prev_time   = time.time()
@@ -297,8 +302,20 @@ def show_video(video_source):
 
                     # ── Pose Rule Engine (every 3rd frame) ───────────────
                     if frame_count % 3 == 0:
-                        rule_flag, skel_crop = run_pose_rules(crop, track_id, track_pose_prev)
-                        track_rule_flag[track_id] = rule_flag
+                        raw_flag, skel_crop = run_pose_rules(crop, track_id, track_pose_prev)
+
+                        # Temporal confirmation — only confirm if rule fires N times in a row
+                        if track_id not in track_rule_history:
+                            track_rule_history[track_id] = deque(maxlen=RULE_CONFIRM_N)
+                        track_rule_history[track_id].append(raw_flag)
+
+                        hist = track_rule_history[track_id]
+                        if (len(hist) == RULE_CONFIRM_N and
+                                all(f == hist[0] and f is not None for f in hist)):
+                            track_rule_flag[track_id] = hist[0]  # confirmed
+                        elif raw_flag is None:
+                            track_rule_flag[track_id] = None      # reset on normal frame
+
                         try:
                             if skel_crop.shape == crop.shape:
                                 annotated_frame[y1:y2, x1:x2] = skel_crop
@@ -327,10 +344,11 @@ def show_video(video_source):
                             print(f"[LSTM ERROR]: {e}")
 
                     # ── Combined Verdict ──────────────────────────────────
-                    lstm_verdict      = track_status.get(track_id, "Tracking...")
-                    rule_flag         = track_rule_flag.get(track_id)
-                    is_lstm_sus       = "SUSPICIOUS" in lstm_verdict
-                    is_rule_sus       = rule_flag is not None
+                    lstm_verdict = track_status.get(track_id, "Tracking...")
+                    rule_flag    = track_rule_flag.get(track_id)  # confirmed flag only
+                    lstm_conf    = float(lstm_verdict.split('(')[1].rstrip('%)')) / 100.0 if '(' in lstm_verdict else 0.0
+                    is_lstm_sus  = "SUSPICIOUS" in lstm_verdict and lstm_conf > 0.75  # raised bar
+                    is_rule_sus  = rule_flag is not None
 
                     if is_lstm_sus and is_rule_sus:
                         display_text = f"SUSPICIOUS | {rule_flag}"
