@@ -8,9 +8,10 @@ __pycache__/
 .vscode/
 .idea/
 
-# Datasets and Media
+# Datasets and Media (too large for git)
 archive.zip
-src/data/
+src/data/*
+!src/data/README.md
 src/manual_test/
 
 # Large Model Weights
