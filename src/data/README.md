@@ -7,16 +7,17 @@ This directory is excluded from version control due to its size.
 ```
 src/data/
 ├── normal/
-│   ├── sequence_0001/
+│   ├── Train_NormalVideos/
 │   │   ├── frame_001.jpg
 │   │   ├── frame_002.jpg
 │   │   └── ...
-│   └── sequence_XXXX/
+│   └── Test_NormalVideos/
+│       └── ...
 └── suspicious/
-    ├── sequence_0001/
-    │   ├── frame_001.jpg
+    ├── Train_SuspiciousVideos/
     │   └── ...
-    └── sequence_XXXX/
+    └── Test_SuspiciousVideos/
+        └── ...
 ```
 
 ## Source
