@@ -16,6 +16,7 @@ src/manual_test/
 
 # Large Model Weights
 *.pt
+*.task
 simple_cnn_model.h5
 
 # Local logs
