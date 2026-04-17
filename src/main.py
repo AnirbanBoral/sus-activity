@@ -37,10 +37,11 @@ except ImportError:
 USE_YOLO_HYBRID = True
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH  = os.path.join(SCRIPT_DIR, 'mobilenet_model.h5')
+MODEL_PATH  = os.path.join(SCRIPT_DIR, 'hybrid_pose_mobilenet_model.h5')
 POSE_MODEL  = os.path.join(SCRIPT_DIR, 'pose_landmarker_lite.task')
 IMAGE_HEIGHT, IMAGE_WIDTH = 128, 128
 SEQUENCE_LENGTH = 12
+POSE_VECTOR_SIZE = 99
 
 # Pose rule thresholds (tuned to reduce false positives)
 RAISED_ARM_THRESH = 0.22   # wrist must be well above shoulder (was 0.10)
@@ -150,15 +151,18 @@ def _draw_skeleton(crop_bgr, landmarks):
     return annotated
 
 
-def run_pose_rules(crop_bgr, track_id, track_pose_prev):
+def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose):
     """
     Runs MediaPipe PoseLandmarker on the given person crop.
-    Returns (rule_flag: str | None, annotated_crop: ndarray)
+    Returns (rule_flag, annotated_crop, pose_vector)
     """
+    # Skeleton Memory: Default to the last known valid pose vector (or zeros if new)
+    pose_vec = track_last_valid_pose.get(track_id, np.zeros((POSE_VECTOR_SIZE,), dtype='float32'))
+    
     if pose_landmarker is None:
-        return None, crop_bgr
+        return None, crop_bgr, pose_vec
     if crop_bgr.shape[0] < 48 or crop_bgr.shape[1] < 48:
-        return None, crop_bgr
+        return None, crop_bgr, pose_vec
 
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
@@ -166,12 +170,21 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev):
     try:
         result = pose_landmarker.detect(mp_img)
     except Exception:
-        return None, crop_bgr
+        return None, crop_bgr, pose_vec
 
     if not result.pose_landmarks:
-        return None, crop_bgr
+        return None, crop_bgr, pose_vec
 
+    # We detected a valid new pose! Flatten it.
     lm = result.pose_landmarks[0]   # first (and only) person in the crop
+
+    vec = []
+    for landmark in lm:
+        vec.extend([landmark.x, landmark.y, landmark.z])
+    pose_vec = np.array(vec, dtype='float32')
+    
+    # Save to memory for future blurry frames
+    track_last_valid_pose[track_id] = pose_vec
 
     # Landmark indices
     nose      = lm[IDX_NOSE]
@@ -210,7 +223,7 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev):
     track_pose_prev[track_id] = hip_x
 
     annotated = _draw_skeleton(crop_bgr, lm)
-    return raw_flag, annotated
+    return raw_flag, annotated, pose_vec
 
 
 # =============================================================================
@@ -223,11 +236,13 @@ def show_video(video_source):
         return
 
     track_buffers       = {}
+    track_pose_buffers  = {}   # Stores 99-dim vectors for the LSTM
     track_status        = {}
     track_scores        = {}
     track_pose_prev     = {}
     track_rule_flag     = {}   # confirmed rule flag
     track_rule_history  = {}   # deque of recent raw flags for temporal smoothing
+    track_last_valid_pose = {} # SKELETON MEMORY
 
     alert_sent  = False
     prev_time   = time.time()
@@ -236,10 +251,10 @@ def show_video(video_source):
     executor = ThreadPoolExecutor(max_workers=3)
     processing_tracks = set()
 
-    def evaluate_intent_async(t_id, X_seq):
+    def evaluate_intent_async(t_id, X_seq, X_pose_seq):
         nonlocal alert_sent
         try:
-            preds = lstm_model(X_seq, training=False).numpy()[0]
+            preds = lstm_model({"image_input": X_seq, "pose_input": X_pose_seq}, training=False).numpy()[0]
             if t_id not in track_scores:
                 track_scores[t_id] = deque(maxlen=3)
             track_scores[t_id].append(preds)
@@ -300,27 +315,26 @@ def show_video(video_source):
                     if crop.size == 0:
                         continue
 
-                    # ── Pose Rule Engine (every 3rd frame) ───────────────
-                    if frame_count % 3 == 0:
-                        raw_flag, skel_crop = run_pose_rules(crop, track_id, track_pose_prev)
+                    # ── Pose Rule Engine (Run every frame to feed LSTM) ───────────────
+                    raw_flag, skel_crop, pose_vec = run_pose_rules(crop, track_id, track_pose_prev, track_last_valid_pose)
 
-                        # Temporal confirmation — only confirm if rule fires N times in a row
-                        if track_id not in track_rule_history:
-                            track_rule_history[track_id] = deque(maxlen=RULE_CONFIRM_N)
-                        track_rule_history[track_id].append(raw_flag)
+                    # Temporal confirmation — only confirm if rule fires N times in a row
+                    if track_id not in track_rule_history:
+                        track_rule_history[track_id] = deque(maxlen=RULE_CONFIRM_N)
+                    track_rule_history[track_id].append(raw_flag)
 
-                        hist = track_rule_history[track_id]
-                        if (len(hist) == RULE_CONFIRM_N and
-                                all(f == hist[0] and f is not None for f in hist)):
-                            track_rule_flag[track_id] = hist[0]  # confirmed
-                        elif raw_flag is None:
-                            track_rule_flag[track_id] = None      # reset on normal frame
+                    hist = track_rule_history[track_id]
+                    if (len(hist) == RULE_CONFIRM_N and
+                            all(f == hist[0] and f is not None for f in hist)):
+                        track_rule_flag[track_id] = hist[0]  # confirmed
+                    elif raw_flag is None:
+                        track_rule_flag[track_id] = None      # reset on normal frame
 
-                        try:
-                            if skel_crop.shape == crop.shape:
-                                annotated_frame[y1:y2, x1:x2] = skel_crop
-                        except Exception:
-                            pass
+                    try:
+                        if skel_crop.shape == crop.shape:
+                            annotated_frame[y1:y2, x1:x2] = skel_crop
+                    except Exception:
+                        pass
 
                     # ── LSTM Buffer & Async Inference ─────────────────────
                     if has_lstm:
@@ -331,15 +345,18 @@ def show_video(video_source):
                                     cv2.COLOR_BGR2RGB), dtype='float32'))
                             if track_id not in track_buffers:
                                 track_buffers[track_id] = deque(maxlen=SEQUENCE_LENGTH)
+                                track_pose_buffers[track_id] = deque(maxlen=SEQUENCE_LENGTH)
                                 track_status[track_id]  = "Tracking..."
                             track_buffers[track_id].append(arr)
+                            track_pose_buffers[track_id].append(pose_vec)
 
                             if (len(track_buffers[track_id]) == SEQUENCE_LENGTH and
                                     (frame_count + track_id) % 5 == 0 and
                                     track_id not in processing_tracks):
                                 processing_tracks.add(track_id)
-                                X = np.expand_dims(np.array(track_buffers[track_id]), axis=0)
-                                executor.submit(evaluate_intent_async, track_id, X)
+                                X_img = np.expand_dims(np.array(track_buffers[track_id]), axis=0)
+                                X_pose = np.expand_dims(np.array(track_pose_buffers[track_id]), axis=0)
+                                executor.submit(evaluate_intent_async, track_id, X_img, X_pose)
                         except Exception as e:
                             print(f"[LSTM ERROR]: {e}")
 
