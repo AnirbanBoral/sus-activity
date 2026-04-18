@@ -314,7 +314,7 @@ def check_proximity(boxes, track_ids, fw, fh):
 def weapon_near_person(px1, py1, px2, py2, weapon_boxes):
     for wb in weapon_boxes:
         wx1, wy1, wx2, wy2 = map(int, wb)
-        wcx, wcy = (wx1+wx2)/2, (wcy+wy2)/2
+        wcx, wcy = (wx1+wx2)/2, (wy1+wy2)/2
         if px1 < wcx < px2 and py1 < wcy < py2:
             return True
     return False
@@ -587,7 +587,7 @@ def show_video(video_source):
                         cx, cy = get_center(x1, y1, x2, y2, frame.shape[1], frame.shape[0])
 
                         vel_flag    = check_velocity(track_id, cx, cy, curr_time, track_center_history)
-                        loiter_flag = check_loitering(track_id, cx, cy, now,
+                        loiter_flag = check_loitering(track_id, cx, cy, curr_time,
                                                       track_first_seen, track_last_moved,
                                                       track_center_history)
                         weapon_flag = weapon_near_person(x1, y1, x2, y2, weapon_boxes)
