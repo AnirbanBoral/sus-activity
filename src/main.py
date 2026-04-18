@@ -18,6 +18,16 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
+# FIX: GPU Memory Growth configuration (prevents VRAM-hogging crashes)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"[OK] GPU Memory Growth Enabled: {gpus[0].name}")
+    except Exception as e:
+        print(f"[WARNING] Could not enable GPU growth: {e}")
+
 # MediaPipe Tasks API
 try:
     import mediapipe as mp
@@ -86,8 +96,14 @@ except Exception as e:
     lstm_model = None
     has_lstm = False
 
-print("[INFO] Initializing YOLO Tracker...")
-yolo_model = YOLO("yolov8s.pt") if YOLO else None
+print("[INFO] Initializing YOLO Tracker (Nano)...")
+yolo_model = YOLO("yolov8n.pt") if YOLO else None
+if yolo_model:
+    try:
+        yolo_model.to("cuda")
+        print("[OK] YOLO CUDA acceleration enabled.")
+    except Exception:
+        print("[INFO] CUDA not available for YOLO, using CPU.")
 
 # Initialize MediaPipe PoseLandmarker
 pose_landmarker = None
@@ -413,11 +429,11 @@ def show_video(video_source):
         root.deiconify()
         return
 
-    # Resolution lock for webcam only; buffer tuning applies to both
+    # Resolution lock for webcam; buffer tuning for both
     if video_source == 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Set buffer to 1 for lowest latency
 
     # Tracking state
     track_buffers         = {}
@@ -496,9 +512,12 @@ def show_video(video_source):
                     break
                 continue
 
-            results = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
-            # FIX 9: Remove duplicate annotated_frame = frame.copy() that was overwriting annotations
-            # (original had this line AFTER writing weapon boxes — erasing them)
+            # 🏎️ YOLO Performance: Run every 2 frames + Half Precision
+            if frame_count % 2 == 0 or 'results' not in locals():
+                results = yolo_model.track(frame, persist=True, half=True,
+                                           classes=[0]+WEAPON_CLASSES, verbose=False)
+            
+            # (Optional) HUD Diagnostic: time.time() vs prev_time for loop speed
 
             weapon_boxes = []
             person_boxes = []
@@ -574,7 +593,7 @@ def show_video(video_source):
                                 track_pose_buffers[track_id].append(pose_vec)
 
                                 if (len(track_buffers[track_id]) == SEQUENCE_LENGTH and
-                                        (frame_count + track_id) % 3 == 0 and
+                                        (frame_count + track_id) % 6 == 0 and # Reduce LSTM frequency
                                         track_id not in processing_tracks):
                                     processing_tracks.add(track_id)
                                     X_img  = np.expand_dims(np.array(track_buffers[track_id]),      axis=0)
@@ -672,8 +691,8 @@ def show_video(video_source):
                             f"CONFLICT ZONE: {len(conflict_ids)} PERSONS",
                             (30, frame.shape[0] - 80), font, 1.2, (0, 100, 255), 3)
 
-            # Scale to 720p
-            DISPLAY_HEIGHT = 720
+            # Scale to 480p for display (significant rendering speedup)
+            DISPLAY_HEIGHT = 480
             orig_h, orig_w = annotated_frame.shape[:2]
             scale    = DISPLAY_HEIGHT / max(orig_h, 1)
             scaled_w = int(orig_w * scale)
