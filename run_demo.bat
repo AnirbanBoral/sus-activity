@@ -17,40 +17,45 @@ if %errorlevel% neq 0 (
 )
 
 :: 2. Check for Virtual Environment
-if not exist .venv\Scripts\activate.bat (
-    echo [INFO] Virtual environment (.venv) not found.
-    echo [INFO] Starting automatic environment setup...
-    
-    echo [INFO] Creating virtual environment...
-    python -m venv .venv
-    if %errorlevel% neq 0 (
-        echo [ERROR] Failed to create virtual environment!
-        pause
-        exit /b
-    )
-    
-    echo [INFO] Upgrading pip...
-    .venv\Scripts\python.exe -m pip install --upgrade pip
-    
-    echo [INFO] Installing required libraries (this may take a minute)...
-    .venv\Scripts\python.exe -m pip install -r requirements.txt
-    if %errorlevel% neq 0 (
-        echo [ERROR] Failed to install requirements!
-        pause
-        exit /b
-    )
-    echo [INFO] Setup complete!
-)
+if exist .venv\Scripts\activate.bat goto ACTIVATE
 
-:: 3. Launch System
+echo [INFO] Virtual environment (.venv) not found.
+echo [INFO] Starting automatic environment setup...
+
+echo [INFO] Creating virtual environment...
+python -m venv .venv
+if %errorlevel% neq 0 goto VENV_ERROR
+
+echo [INFO] Upgrading pip...
+.venv\Scripts\python.exe -m pip install --upgrade pip
+
+echo [INFO] Installing required libraries (this may take a minute)...
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+if %errorlevel% neq 0 goto INSTALL_ERROR
+
+echo [INFO] Setup complete!
+
+:ACTIVATE
 echo [INFO] Activating Virtual Environment...
 call .venv\Scripts\activate.bat
 
 echo [INFO] Launching AI Surveillance Hub...
 python src\main.py
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Application crashed with exit code %ERRORLEVEL%
-    pause
-)
+if %ERRORLEVEL% NEQ 0 goto APP_ERROR
+exit /b
+
+:VENV_ERROR
+echo [ERROR] Failed to create virtual environment!
+pause
+exit /b
+
+:INSTALL_ERROR
+echo [ERROR] Failed to install requirements!
+pause
+exit /b
+
+:APP_ERROR
+echo [ERROR] Application crashed with exit code %ERRORLEVEL%
+pause
 exit /b
