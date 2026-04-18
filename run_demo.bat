@@ -1,18 +1,27 @@
 @echo off
-echo ======================================================
-echo   Suspicious Activity Detection - One-Click Launcher
-echo ======================================================
-echo.
+:: Force the script to run from its own directory
+cd /d "%~dp0"
 
-if not exist ".venv" (
-    echo [ERROR] Virtual environment not found! 
-    echo Please run setup first.
+title Suspicious Activity Detection - Hybrid AI
+echo [INFO] Starting Hybrid AI Surveillance System...
+
+:: Check if the activation script exists
+if not exist .venv\Scripts\activate.bat goto NO_VENV
+
+echo [INFO] Activating Virtual Environment...
+call .venv\Scripts\activate.bat
+
+echo [INFO] Launching UI...
+python src\main.py
+
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Application crashed with exit code %ERRORLEVEL%
     pause
-    exit /b
 )
+exit /b
 
-echo [INFO] Activating environment and launching app...
-.\.venv\Scripts\python.exe src\main.py
-echo.
-echo [INFO] Session ended.
+:NO_VENV
+echo [ERROR] Virtual environment (.venv) not found!
+echo [INFO] Please ensure the .venv folder is in this directory.
 pause
+exit /b
