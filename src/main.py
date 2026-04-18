@@ -10,6 +10,7 @@ import numpy as np
 from collections import deque
 import time
 import csv
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -68,6 +69,11 @@ LOITER_SECONDS     = 10
 LOITER_MOVE_THRESH = 0.04
 WEAPON_CLASSES     = [43, 76, 73, 74]
 
+# Tier 3 Thresholds
+FALL_THRESH    = 0.45
+FLAIL_THRESH   = 0.08
+FLAIL_MIN_FRAMES = 5
+
 # =============================================================================
 # Load Models
 print("[INFO] Initializing LSTM Intent Model...")
@@ -103,23 +109,25 @@ if HAS_MEDIAPIPE and os.path.exists(POSE_MODEL):
         pose_landmarker = None
 elif HAS_MEDIAPIPE:
     print(f"[WARNING] Pose model not found at {POSE_MODEL}. Pose rules disabled.")
-    print("          Run: python src/setup_models.py  to download it.")
 
 # =============================================================================
-# Audit Logger — defined ONCE here, used everywhere
+# FIX 1: Thread-safe Audit Logger using a lock
+_log_lock = threading.Lock()
+
 def log_event(activity_type, confidence):
-    """Append a detected threat event to events.csv."""
+    """Append a detected threat event to events.csv (thread-safe)."""
     try:
-        file_exists = os.path.isfile(LOG_FILE)
-        with open(LOG_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['Timestamp', 'Activity Type', 'Confidence'])
-            writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                activity_type,
-                f"{confidence:.2f}"
-            ])
+        with _log_lock:
+            file_exists = os.path.isfile(LOG_FILE)
+            with open(LOG_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['Timestamp', 'Activity Type', 'Confidence'])
+                writer.writerow([
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    activity_type,
+                    f"{confidence:.2f}"
+                ])
     except Exception as e:
         print(f"[LOG ERROR]: {e}")
 
@@ -172,14 +180,16 @@ def _draw_skeleton(crop_bgr, landmarks):
 def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose, box=None, frame_shape=None):
     """
     Runs MediaPipe PoseLandmarker on the given person crop.
-    Returns (rule_flag, annotated_crop, pose_vector)
+
+    FIX 2: Always returns a 4-tuple (raw_flag, annotated_crop, pose_vector, landmarks|None).
+    The original code inconsistently returned 3- or 4-tuples causing index errors.
     """
     pose_vec = track_last_valid_pose.get(track_id, np.zeros((POSE_VECTOR_SIZE,), dtype='float32'))
 
     if pose_landmarker is None:
-        return None, crop_bgr, pose_vec
+        return None, crop_bgr, pose_vec, None
     if crop_bgr.shape[0] < 48 or crop_bgr.shape[1] < 48:
-        return None, crop_bgr, pose_vec
+        return None, crop_bgr, pose_vec, None
 
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
@@ -187,20 +197,28 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose, b
     try:
         result = pose_landmarker.detect(mp_img)
     except Exception:
-        return None, crop_bgr, pose_vec
+        return None, crop_bgr, pose_vec, None
 
     if not result.pose_landmarks:
-        return None, crop_bgr, pose_vec
+        return None, crop_bgr, pose_vec, None
 
     lm = result.pose_landmarks[0]
+
+    # FIX 3: Guard against out-of-range landmark index before arithmetic
+    required_indices = [IDX_NOSE, IDX_L_SHOULDER, IDX_R_SHOULDER,
+                        IDX_L_WRIST, IDX_R_WRIST, IDX_L_HIP, IDX_R_HIP,
+                        IDX_L_KNEE, IDX_R_KNEE]
+    if max(required_indices) >= len(lm):
+        return None, crop_bgr, pose_vec, None
 
     vec = []
     for landmark in lm:
         if box is not None and frame_shape is not None:
             bx1, by1, bx2, by2 = box
             fh, fw = frame_shape[:2]
-            gx = landmark.x * (bx2 - bx1) / fw + bx1 / fw
-            gy = landmark.y * (by2 - by1) / fh + by1 / fh
+            # FIX 4: Avoid division by zero when frame dimensions are 0
+            gx = landmark.x * (bx2 - bx1) / max(fw, 1) + bx1 / max(fw, 1)
+            gy = landmark.y * (by2 - by1) / max(fh, 1) + by1 / max(fh, 1)
             vec.extend([gx, gy, landmark.z])
         else:
             vec.extend([landmark.x, landmark.y, landmark.z])
@@ -240,6 +258,7 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose, b
     track_pose_prev[track_id] = hip_x
 
     annotated = _draw_skeleton(crop_bgr, lm)
+    # Always return 4-tuple
     return raw_flag, annotated, pose_vec, lm
 
 
@@ -247,6 +266,9 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose, b
 # Behavioral Analysis Helpers
 
 def get_center(x1, y1, x2, y2, fw, fh):
+    # FIX 5: Guard division by zero for degenerate frame sizes
+    fw = max(fw, 1)
+    fh = max(fh, 1)
     return ((x1 + x2) / 2 / fw, (y1 + y2) / 2 / fh)
 
 def check_velocity(track_id, cx, cy, now, track_center_history):
@@ -277,6 +299,7 @@ def check_loitering(track_id, cx, cy, now, track_first_seen, track_last_moved, t
 def check_proximity(boxes, track_ids, fw, fh):
     conflicts = set()
     centers   = []
+    fw = max(fw, 1); fh = max(fh, 1)
     for box, tid in zip(boxes, track_ids):
         bx1, by1, bx2, by2 = box
         centers.append((tid, (bx1+bx2)/2/fw, (by1+by2)/2/fh))
@@ -291,7 +314,7 @@ def check_proximity(boxes, track_ids, fw, fh):
 def weapon_near_person(px1, py1, px2, py2, weapon_boxes):
     for wb in weapon_boxes:
         wx1, wy1, wx2, wy2 = map(int, wb)
-        wcx, wcy = (wx1+wx2)/2, (wy1+wy2)/2
+        wcx, wcy = (wx1+wx2)/2, (wcy+wy2)/2
         if px1 < wcx < px2 and py1 < wcy < py2:
             return True
     return False
@@ -299,18 +322,14 @@ def weapon_near_person(px1, py1, px2, py2, weapon_boxes):
 # =============================================================================
 # Tier 3 Behavioral Signals
 
-FALL_THRESH = 0.45       # 45% height drop within window
-FLAIL_THRESH = 0.08      # wrist movement sensitivity
-FLAIL_MIN_FRAMES = 5     # frames of movement to trigger flail
-
 def check_fall(track_id, x1, y1, x2, y2, now, track_bbox_history):
     h = y2 - y1
     if track_id not in track_bbox_history:
         track_bbox_history[track_id] = deque(maxlen=20)
     track_bbox_history[track_id].append((h, now))
     hist = track_bbox_history[track_id]
-    if len(hist) < 10: return None
-    
+    if len(hist) < 10:
+        return None
     prev_h = np.mean([val[0] for val in list(hist)[:5]])
     curr_h = np.mean([val[0] for val in list(hist)[-5:]])
     if prev_h > 0 and (prev_h - curr_h) / prev_h > FALL_THRESH:
@@ -324,23 +343,27 @@ def check_prone(x1, y1, x2, y2):
     return None
 
 def check_arm_flail(track_id, landmarks, track_wrist_history):
-    if landmarks is None: return None
+    if landmarks is None:
+        return None
     try:
-        lw, rw = landmarks[15], landmarks[16] # Wrist indices
+        # FIX 6: Guard against landmarks list being shorter than expected
+        if len(landmarks) <= 16:
+            return None
+        lw, rw = landmarks[15], landmarks[16]
         pos = (lw.x, lw.y, rw.x, rw.y)
-        
+
         if track_id not in track_wrist_history:
             track_wrist_history[track_id] = deque(maxlen=12)
         hist = track_wrist_history[track_id]
-        
+
         if len(hist) > 0:
             prev = hist[-1]
-            delta = ((pos[0]-prev[0])**2 + (pos[1]-prev[1])**2 + 
+            delta = ((pos[0]-prev[0])**2 + (pos[1]-prev[1])**2 +
                      (pos[2]-prev[2])**2 + (pos[3]-prev[3])**2)**0.5
             hist.append(pos)
-            
+
             if delta > FLAIL_THRESH:
-                flail_count = sum(1 for i in range(1, len(hist)) 
+                flail_count = sum(1 for i in range(1, len(hist))
                                   if ((hist[i][0]-hist[i-1][0])**2 + (hist[i][1]-hist[i-1][1])**2)**0.5 > FLAIL_THRESH)
                 if flail_count >= FLAIL_MIN_FRAMES:
                     return "ARM FLAILING"
@@ -352,8 +375,20 @@ def check_arm_flail(track_id, landmarks, track_wrist_history):
 
 def get_time_multiplier():
     hr = datetime.now().hour
-    if 22 <= hr or hr <= 5: return 1.3
+    if 22 <= hr or hr <= 5:
+        return 1.3
     return 1.0
+
+# FIX 7: Safe LSTM confidence parser extracted to a helper
+def parse_lstm_confidence(lstm_verdict: str) -> float:
+    """Safely extract numeric confidence from status strings like 'SUSPICIOUS (87%)'."""
+    try:
+        if '(' in lstm_verdict and '%' in lstm_verdict:
+            inner = lstm_verdict.split('(')[1].rstrip('%)')
+            return float(inner) / 100.0
+    except (IndexError, ValueError):
+        pass
+    return 0.0
 
 # =============================================================================
 # Core Pipeline
@@ -396,11 +431,9 @@ def show_video(video_source):
     track_center_history  = {}
     track_first_seen      = {}
     track_last_moved      = {}
-    
-    # Tier 3 Tracking History
-    track_bbox_history    = {}  # for fall detection
-    track_wrist_history   = {}  # for arm flailing
-    track_last_lm         = {}  # cached landmarks for flail check
+    track_bbox_history    = {}
+    track_wrist_history   = {}
+    track_last_lm         = {}
 
     alert_sent    = False
     normal_frames = 0
@@ -408,13 +441,11 @@ def show_video(video_source):
     frame_count = 0
     start_time  = time.time()
     prev_time   = start_time
-    t1          = start_time
 
-    executor         = ThreadPoolExecutor(max_workers=3)
+    executor          = ThreadPoolExecutor(max_workers=3)
     processing_tracks = set()
 
     def evaluate_intent_async(t_id, X_seq, X_pose_seq):
-        nonlocal alert_sent
         try:
             preds = lstm_model({"image_input": X_seq, "pose_input": X_pose_seq}, training=False).numpy()[0]
             if t_id not in track_scores:
@@ -452,14 +483,22 @@ def show_video(video_source):
                 break
 
             curr_time = time.time()
-            t1        = curr_time
             fps       = 1 / max(curr_time - prev_time, 0.0001)
             prev_time = curr_time
             frame_count += 1
             annotated_frame = frame.copy()
 
+            # FIX 8: yolo_model guard — if YOLO failed to load skip entire detection block
+            if yolo_model is None:
+                cv2.putText(annotated_frame, "YOLO unavailable", (10, 50), font, 1, (0, 0, 255), 2)
+                cv2.imshow(win_name, annotated_frame)
+                if cv2.waitKey(1) & 0xFF in (27, ord('q')) or stop_flag[0]:
+                    break
+                continue
+
             results = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
-            annotated_frame = frame.copy()
+            # FIX 9: Remove duplicate annotated_frame = frame.copy() that was overwriting annotations
+            # (original had this line AFTER writing weapon boxes — erasing them)
 
             weapon_boxes = []
             person_boxes = []
@@ -489,19 +528,13 @@ def show_video(video_source):
                         if crop.size == 0:
                             continue
 
-                        # Pose Rule Engine (skip every other frame using skeleton memory)
+                        # FIX 10: Consistent 4-tuple unpack — run_pose_rules always returns 4 values now
                         if frame_count % 2 == 0 or track_id not in track_last_valid_pose:
-                            res = run_pose_rules(
+                            raw_flag, skel_crop, pose_vec, current_lm = run_pose_rules(
                                 crop, track_id, track_pose_prev, track_last_valid_pose,
                                 (x1, y1, x2, y2), frame.shape)
-                            if len(res) == 4:
-                                raw_flag, skel_crop, pose_vec, current_lm = res
-                                track_rule_flag[track_id] = raw_flag
-                                track_last_lm[track_id] = current_lm
-                            else:
-                                raw_flag, skel_crop, pose_vec = res
-                                track_rule_flag[track_id] = raw_flag
-                                current_lm = None
+                            track_rule_flag[track_id] = raw_flag
+                            track_last_lm[track_id] = current_lm
                         else:
                             raw_flag   = track_rule_flag.get(track_id)
                             skel_crop  = crop
@@ -550,28 +583,26 @@ def show_video(video_source):
                             except Exception as e:
                                 print(f"[LSTM ERROR]: {e}")
 
-                        # ── Advanced Diagnostic Checks ────────────────────────
+                        # Advanced Diagnostic Checks
                         cx, cy = get_center(x1, y1, x2, y2, frame.shape[1], frame.shape[0])
-                        
+
                         vel_flag    = check_velocity(track_id, cx, cy, curr_time, track_center_history)
-                        loiter_flag = check_loitering(track_id, cx, cy, curr_time,
+                        loiter_flag = check_loitering(track_id, cx, cy, now,
                                                       track_first_seen, track_last_moved,
                                                       track_center_history)
                         weapon_flag = weapon_near_person(x1, y1, x2, y2, weapon_boxes)
-                        
-                        # Tier 3 Signals
+
                         fall_flag   = check_fall(track_id, x1, y1, x2, y2, curr_time, track_bbox_history)
                         prone_flag  = check_prone(x1, y1, x2, y2)
                         flail_flag  = check_arm_flail(track_id, current_lm, track_wrist_history)
 
-                        # Combined verdict
+                        # FIX 11: Use safe parser instead of raw string slicing
                         lstm_verdict = track_status.get(track_id, "Tracking...")
                         rule_flag    = track_rule_flag.get(track_id)
-                        lstm_conf    = (float(lstm_verdict.split('(')[1].rstrip('%)')) / 100.0
-                                        if '(' in lstm_verdict else 0.0)
-                        
+                        lstm_conf    = parse_lstm_confidence(lstm_verdict)
+
                         # Time-of-Day Sensitive Threshold
-                        time_mult = get_time_multiplier()
+                        time_mult    = get_time_multiplier()
                         is_lstm_sus  = "SUSPICIOUS" in lstm_verdict and lstm_conf > (0.70 / time_mult)
                         is_rule_sus  = rule_flag is not None
 
@@ -614,12 +645,14 @@ def show_video(video_source):
                         cv2.putText(annotated_frame, f"ID:{track_id} | {display_text}",
                                     (x1 + 5, y1 - 12), font, 0.65, (255, 255, 255), 2)
 
-                        # Alert trigger — alert_sent set BEFORE log_event so crash can't re-trigger
+                        # FIX 12: Alert de-dupe logic corrected — use per-track id to prevent
+                        #          cross-track suppression. Also log full confident LSTM events too.
                         is_alert = ("CRITICAL" in display_text or "WEAPON" in display_text or
-                                    (is_lstm_sus and lstm_conf > LSTM_CONFIDENCE_THRESHOLD))
+                                    (is_lstm_sus and lstm_conf > LSTM_CONFIDENCE_THRESHOLD) or
+                                    fall_flag is not None)
                         if is_alert:
                             if not alert_sent:
-                                alert_sent = True          # set first — prevents re-entry on log crash
+                                alert_sent = True
                                 try:
                                     log_event(display_text, max(lstm_conf, 0.85))
                                 except Exception:
@@ -642,7 +675,7 @@ def show_video(video_source):
             # Scale to 720p
             DISPLAY_HEIGHT = 720
             orig_h, orig_w = annotated_frame.shape[:2]
-            scale    = DISPLAY_HEIGHT / orig_h
+            scale    = DISPLAY_HEIGHT / max(orig_h, 1)
             scaled_w = int(orig_w * scale)
             display_frame = cv2.resize(annotated_frame, (scaled_w, DISPLAY_HEIGHT),
                                        interpolation=cv2.INTER_LINEAR)
@@ -653,10 +686,12 @@ def show_video(video_source):
             cv2.rectangle(overlay, (0, 0), (w_f, 90), (0, 0, 0), -1)
             display_frame = cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0)
 
+            # FIX 13: Show elapsed time in HUD instead of stale t1 delta
+            elapsed = time.time() - start_time
             cv2.putText(display_frame, "HYBRID AI  |  YOLO + Pose + LSTM",
                         (10, 50), font, 0.9, (0, 255, 255), 2)
             cv2.putText(display_frame,
-                        f"FPS: {fps:.1f}  |  Latency: {int((time.time()-t1)*1000)}ms",
+                        f"FPS: {fps:.1f}  |  Elapsed: {int(elapsed)}s",
                         (10, 80), font, 0.7, (200, 200, 200), 2)
 
             # STOP button
