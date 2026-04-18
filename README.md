@@ -1,27 +1,41 @@
-# Real-Time Suspicious Activity Detection
+# Hybrid Multimodal Suspicious Activity Detection System
 
-A robust, multi-threaded computer vision pipeline designed to detect anomalous or highly-suspicious spatial-temporal actions (e.g., fighting, sudden attacks) in real-time camera feeds. 
+A high-performance computer vision pipeline designed to detect violent or suspicious actions (e.g., fighting, lunging, striking) in real-time camera feeds. This system uses a multi-layered approach combining spatial tracking, geometric pose estimation, and temporal sequence modeling.
 
 ## 🧠 System Architecture
 
-The pipeline securely leverages a **Hybrid MobileNetV2-LSTM & YOLOv8** architecture completely decoupled for high-performance multi-threading:
-*   **Spatial Tracker (YOLOv8)**: Handles global object detection, tracking individual subjects dynamically, and maintaining unique identification over deep frame intervals securely. 
-*   **Temporal Intent Engine (MobileNetV2 + LSTM)**: Consumes raw RGB tracking crops natively scaled to `128x128`. The base MobileNet CNN extracts advanced textural feature manifolds which are piped sequentially into an LSTM to analyze the "Intent" of action (flagging hyper-erratic motion sequences like punches, weapons, or attacks).
+The pipeline leverages a **Hybrid YOLOv8 + MediaPipe + LSTM** architecture for maximum accuracy and real-world robustness:
+*   **Stage 1: Spatial Tracker (YOLOv8)**: Handles global object detection and person tracking.
+*   **Stage 2: Geometric Layer (MediaPipe)**: Extracts 33 skeletal keypoints (99-dim vector), converting raw pixels into a geometric manifold that is invariant to lighting, clothing, or background changes.
+*   **Stage 3: Intent Engine (LSTM)**: Analyzes a rolling 12-frame window of skeleton data to identify temporal patterns of suspicious behavior.
+*   **Stage 4: Geometric Rule Engine**: Calculates joint velocities and strike vectors for redundant safety-overrides.
 
-## 🚀 Key Features
-- **Async Execution Loop:** Uses ThreadPools to decouple standard inference mathematics. Video processing streams securely at 30+ FPS while AI metrics dynamically stagger evaluation logic seamlessly.
-- **Precision Metrics:** Natively trained to specifically reduce False Alarms resulting in >92% Precision ratios.
-- **Dynamic Resizing Mitigation:** Prevents max-pooling noise destruction by preserving 128x128 feature fidelity matrices throughout the intent inference chain.
+## 🚀 Key Results
+- **Training Accuracy:** 97.32%
+- **Final Test Accuracy:** 89.00%
+- **Suspicious Action Precision:** 93.00%
+- **Adversarial Robustness:** Trained on over 100,000 augmented samples (Blur, Dim, Jitter) to ensure performance in poor CCTV conditions.
 
 ## 🛠 Usage
+
+### 1. Initialize Environment
 ```bash
-# Initialize Environment
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# Run Real-Time Camera Feed Detection
+### 2. Run Real-Time Demo
+```bash
+# Run on a test video
+python src/main.py "manual_test/fight.avi"
+
+# Run on live webcam
 python src/main.py 0
 ```
 
-*Note: Due to file-size constraints, the primary 11GB Kaggle tracking dataset has been excluded from the repository.*
+## 📊 Evaluation
+The final confusion matrix and classification report are generated automatically during training and can be found in the `src/` directory as `confusion_matrix.png`.
+
+---
+*Note: The primary 11GB training dataset and augmented image folders are excluded from this repository via .gitignore due to size constraints.*

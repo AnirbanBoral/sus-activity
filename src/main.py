@@ -37,7 +37,7 @@ except ImportError:
 USE_YOLO_HYBRID = True
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH  = os.path.join(SCRIPT_DIR, 'hybrid_pose_mobilenet_model.h5')
+MODEL_PATH  = os.path.join(SCRIPT_DIR, 'hybrid_pose_mobilenet_model_v2.h5')
 POSE_MODEL  = os.path.join(SCRIPT_DIR, 'pose_landmarker_lite.task')
 IMAGE_HEIGHT, IMAGE_WIDTH = 128, 128
 SEQUENCE_LENGTH = 12
@@ -351,7 +351,7 @@ def show_video(video_source):
                             track_pose_buffers[track_id].append(pose_vec)
 
                             if (len(track_buffers[track_id]) == SEQUENCE_LENGTH and
-                                    (frame_count + track_id) % 5 == 0 and
+                                    (frame_count + track_id) % 3 == 0 and
                                     track_id not in processing_tracks):
                                 processing_tracks.add(track_id)
                                 X_img = np.expand_dims(np.array(track_buffers[track_id]), axis=0)
@@ -368,40 +368,44 @@ def show_video(video_source):
                     is_rule_sus  = rule_flag is not None
 
                     if is_lstm_sus and is_rule_sus:
-                        display_text = f"SUSPICIOUS | {rule_flag}"
-                        box_color    = (0, 0, 230)    # Red
+                        display_text = f"CRITICAL | {rule_flag}"
+                        box_color    = (0, 0, 255)    # Solid Red
                     elif is_lstm_sus:
                         display_text = lstm_verdict
-                        box_color    = (0, 50, 220)   # Red-orange
+                        box_color    = (0, 80, 255)   # Red-orange
                     elif is_rule_sus:
-                        display_text = f"ALERT: {rule_flag}"
-                        box_color    = (0, 120, 255)  # Orange
+                        display_text = f"OVERRIDE: {rule_flag}"
+                        box_color    = (0, 140, 255)  # Orange
                     else:
                         display_text = lstm_verdict
-                        box_color    = (0, 190, 60)   # Green
+                        box_color    = (0, 220, 0)    # Bright Green
 
-                    banner_w = min(420, frame.shape[1] - x1)
-                    cv2.rectangle(annotated_frame, (x1, y1 - 38), (x1 + banner_w, y1), box_color, -1)
+                    banner_w = min(480, frame.shape[1] - x1)
+                    cv2.rectangle(annotated_frame, (x1, y1 - 42), (x1 + banner_w, y1), box_color, -1)
                     cv2.putText(annotated_frame,
                                 f"ID:{track_id} | {display_text}",
-                                (x1 + 5, y1 - 10), font, 0.56, (255, 255, 255), 2)
+                                (x1 + 5, y1 - 12), font, 0.65, (255, 255, 255), 2)
+                                
+                    if is_rule_sus or is_lstm_sus:
+                        cv2.putText(annotated_frame, "THREAT DETECTED", (30, 130), font, 2.0, (0, 0, 255), 5)
 
         # ── Scale to 720p ───────────────────────────────────────────────
         DISPLAY_HEIGHT = 720
         orig_h, orig_w = annotated_frame.shape[:2]
         scale = DISPLAY_HEIGHT / orig_h
-        display_frame = cv2.resize(annotated_frame,
-                                   (int(orig_w * scale), DISPLAY_HEIGHT),
-                                   interpolation=cv2.INTER_LINEAR)
+        scaled_w = int(orig_w * scale)
+        
+        display_frame = cv2.resize(annotated_frame, (scaled_w, DISPLAY_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
         # ── HUD ─────────────────────────────────────────────────────────
         h_f, w_f = display_frame.shape[:2]
         overlay = display_frame.copy()
         cv2.rectangle(overlay, (0, 0), (w_f, 90), (0, 0, 0), -1)
         display_frame = cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0)
-        cv2.putText(display_frame, "HYBRID  |  YOLO + Pose + LSTM",
-                    (10, 45), font, 1.1, (0, 255, 255), 2)
-        cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), font, 0.8, (255, 255, 255), 2)
+        
+        # Titles
+        cv2.putText(display_frame, "HYBRID AI VISION (YOLO + Pose + LSTM)", (10, 50), font, 1.2, (0, 255, 255), 2)
+        cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), font, 0.7, (200, 200, 200), 2)
 
         # ── STOP button ──────────────────────────────────────────────────
         bx1, by1, bx2, by2 = w_f - 130, 12, w_f - 10, 60

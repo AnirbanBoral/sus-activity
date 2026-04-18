@@ -16,8 +16,16 @@ src/manual_test/
 
 # Large Model Weights
 *.pt
-*.task
+# !src/pose_landmarker_lite.task (optional to include)
+
+# Allow the final hybrid model and metrics
+!src/hybrid_pose_mobilenet_model_v2.h5
+!src/confusion_matrix.png
+
+# Ignore secondary models
 simple_cnn_model.h5
+mobilenet_model.h5
+hybrid_pose_mobilenet_model.h5
 
 # Local logs
 *.log
