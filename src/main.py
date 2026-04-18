@@ -10,6 +10,7 @@ import numpy as np
 from collections import deque
 import time
 from concurrent.futures import ThreadPoolExecutor
+import csv
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
@@ -110,17 +111,17 @@ if os.path.exists(bg_image_path):
     bg_lbl = tk.Label(root, image=bg_img)
     bg_lbl.place(x=0, y=0)
 else:
-    root.configure(bg="#192841")
+root.configure(bg="#0d1117")
 
 heading = tk.Label(
     root, text="Suspicious Activity Detection", width=40,
-    font=("Times New Roman", 38, 'bold'), bg="#192841", fg="white"
+    font=("Helvetica", 38, 'bold'), bg="#0d1117", fg="#f0f6fc"
 )
 heading.pack(pady=40)
 
 subhead = tk.Label(
-    root, text="YOLOv8  ·  MediaPipe Pose  ·  MobileNetV2-LSTM",
-    font=("Courier", 14), bg="#192841", fg="#00e5ff"
+    root, text="Hybrid Vision Intelligence  ·  YOLO + Pose + LSTM",
+    font=("Helvetica", 12), bg="#0d1117", fg="#8b949e"
 )
 subhead.pack()
 
@@ -229,45 +230,63 @@ def run_pose_rules(crop_bgr, track_id, track_pose_prev, track_last_valid_pose):
 # =============================================================================
 # Core Pipeline
 
-def show_video(video_source):
+    root.withdraw()  # Unify UI: Hide launcher during detection
+    
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"[ERROR] Could not open {video_source}")
+        root.deiconify()
         return
 
+    # Create audit log if it doesn't exist
+    log_file = os.path.join(SCRIPT_DIR, "events.csv")
+    if not os.path.exists(log_file):
+        with open(log_file, 'w', newline='') as f:
+            csv.writer(f).writerow(["Timestamp", "Activity", "Confidence", "Type"])
+
     track_buffers       = {}
-    track_pose_buffers  = {}   # Stores 99-dim vectors for the LSTM
+    track_pose_buffers  = {}   
     track_status        = {}
     track_scores        = {}
     track_pose_prev     = {}
-    track_rule_flag     = {}   # confirmed rule flag
-    track_rule_history  = {}   # deque of recent raw flags for temporal smoothing
-    track_last_valid_pose = {} # SKELETON MEMORY
+    track_rule_flag     = {}   
+    track_rule_history  = {}   
+    track_last_valid_pose = {} 
 
-    alert_sent  = False
+    last_alert_time = 0
     prev_time   = time.time()
     frame_count = 0
+    inference_latency = 0
 
     executor = ThreadPoolExecutor(max_workers=3)
     processing_tracks = set()
 
-    def evaluate_intent_async(t_id, X_seq, X_pose_seq):
-        nonlocal alert_sent
+        nonlocal last_alert_time
         try:
+            start_t = time.time()
             preds = lstm_model({"image_input": X_seq, "pose_input": X_pose_seq}, training=False).numpy()[0]
+            nonlocal inference_latency
+            inference_latency = (time.time() - start_t) * 1000  # Latency HUD data
+            
             if t_id not in track_scores:
                 track_scores[t_id] = deque(maxlen=3)
             track_scores[t_id].append(preds)
             avg  = np.mean(track_scores[t_id], axis=0)
             conf = np.max(avg)
+            
             if np.argmax(avg) == 1 and conf > 0.65:
-                track_status[t_id] = f"SUSPICIOUS ({avg[1]*100:.0f}%)"
-                if not alert_sent:
+                label = f"SUSPICIOUS ({avg[1]*100:.0f}%)"
+                track_status[t_id] = label
+                
+                # Cooldown-based alerts (Professional audit)
+                if time.time() - last_alert_time > 60:
                     try:
                         import notifier; notifier.send_alert()
+                        with open(log_file, 'a', newline='') as f:
+                            csv.writer(f).writerow([time.ctime(), "Suspicious", f"{conf:.2f}", "LSTM Engine"])
                     except Exception:
                         pass
-                    alert_sent = True
+                    last_alert_time = time.time()
             else:
                 track_status[t_id] = f"Normal ({avg[0]*100:.0f}%)"
         except Exception as e:
@@ -387,7 +406,8 @@ def show_video(video_source):
                                 (x1 + 5, y1 - 12), font, 0.65, (255, 255, 255), 2)
                                 
                     if is_rule_sus or is_lstm_sus:
-                        cv2.putText(annotated_frame, "THREAT DETECTED", (30, 130), font, 2.0, (0, 0, 255), 5)
+                        # Move threat alert to bottom for cleaner view
+                        cv2.putText(annotated_frame, "THREAT DETECTED", (30, frame.shape[0] - 30), font, 2.0, (0, 0, 255), 5)
 
         # ── Scale to 720p ───────────────────────────────────────────────
         DISPLAY_HEIGHT = 720
@@ -404,8 +424,9 @@ def show_video(video_source):
         display_frame = cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0)
         
         # Titles
-        cv2.putText(display_frame, "HYBRID AI VISION (YOLO + Pose + LSTM)", (10, 50), font, 1.2, (0, 255, 255), 2)
-        cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), font, 0.7, (200, 200, 200), 2)
+        # Shorten Title & Add Latency HUD
+        cv2.putText(display_frame, "HYBRID AI  |  YOLO + Pose + LSTM", (10, 45), font, 0.9, (0, 255, 255), 2)
+        cv2.putText(display_frame, f"FPS: {fps:.1f}  |  Latency: {inference_latency:.0f}ms", (10, 75), font, 0.6, (200, 200, 200), 1)
 
         # ── STOP button ──────────────────────────────────────────────────
         bx1, by1, bx2, by2 = w_f - 130, 12, w_f - 10, 60
@@ -423,6 +444,7 @@ def show_video(video_source):
     cap.release()
     executor.shutdown(wait=False)
     cv2.destroyAllWindows()
+    root.deiconify()  # Return to launcher
 
 
 # =============================================================================
@@ -436,15 +458,20 @@ def upload_video():
 def use_webcam():
     show_video(0)
 
-btn_frame = tk.Frame(root, bg="#192841")
+btn_frame = tk.Frame(root, bg="#0d1117")
 btn_frame.pack(pady=30)
 
-tk.Button(btn_frame, command=upload_video, text="Upload Video",
-          width=25, font=("Times new roman", 25, "bold"), bg="cyan", fg="black").pack(pady=15)
-tk.Button(btn_frame, command=use_webcam, text="Use Webcam",
-          width=25, font=("Times new roman", 25, "bold"), bg="orange", fg="black").pack(pady=15)
-tk.Button(btn_frame, command=root.destroy, text="Exit",
-          width=25, font=("Times new roman", 25, "bold"), bg="red", fg="white").pack(pady=15)
+btn_style = dict(width=28, font=("Helvetica", 16, "bold"),
+                 bg="#1f6feb", fg="white", relief="flat",
+                 activebackground="#388bfd", cursor="hand2")
+
+tk.Button(btn_frame, text="  Upload Video", command=upload_video,
+          **btn_style).pack(pady=10)
+tk.Button(btn_frame, text="  Use Webcam", command=use_webcam,
+          **btn_style).pack(pady=10)
+tk.Button(btn_frame, text="Exit", command=root.destroy,
+          width=28, font=("Helvetica", 14), bg="#21262d",
+          fg="#8b949e", relief="flat", cursor="hand2").pack(pady=10)
 
 # CLI support
 if len(sys.argv) > 1:
