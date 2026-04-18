@@ -18,16 +18,6 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-# FIX: GPU Memory Growth configuration (prevents VRAM-hogging crashes)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"[OK] GPU Memory Growth Enabled: {gpus[0].name}")
-    except Exception as e:
-        print(f"[WARNING] Could not enable GPU growth: {e}")
-
 # MediaPipe Tasks API
 try:
     import mediapipe as mp
@@ -79,6 +69,20 @@ LOITER_SECONDS     = 10
 LOITER_MOVE_THRESH = 0.04
 WEAPON_CLASSES     = [43, 76, 73, 74]
 
+# Detection toggles — controlled by the settings window (BooleanVar wired in after root created)
+# Keys match the flag strings appended in the pipeline
+DETECTION_TOGGLES = {
+    "WEAPON":       True,
+    "INTENT":       True,
+    "POSE RULES":   True,
+    "FALL":         True,
+    "PERSON DOWN":  True,
+    "RAPID MOVE":   True,
+    "FLAILING":     True,
+    "LOITERING":    True,
+    "PROXIMITY":    True,
+}
+
 # Tier 3 Thresholds
 FALL_THRESH    = 0.45
 FLAIL_THRESH   = 0.08
@@ -96,14 +100,8 @@ except Exception as e:
     lstm_model = None
     has_lstm = False
 
-print("[INFO] Initializing YOLO Tracker (Nano)...")
-yolo_model = YOLO("yolov8n.pt") if YOLO else None
-if yolo_model:
-    try:
-        yolo_model.to("cuda")
-        print("[OK] YOLO CUDA acceleration enabled.")
-    except Exception:
-        print("[INFO] CUDA not available for YOLO, using CPU.")
+print("[INFO] Initializing YOLO Tracker...")
+yolo_model = YOLO("yolov8s.pt") if YOLO else None
 
 # Initialize MediaPipe PoseLandmarker
 pose_landmarker = None
@@ -352,9 +350,20 @@ def check_fall(track_id, x1, y1, x2, y2, now, track_bbox_history):
         return "FALL DETECTED"
     return None
 
-def check_prone(x1, y1, x2, y2):
+PRONE_RATIO      = 2.2    # bbox must be much wider than tall (was 1.6 — too sensitive)
+PRONE_MIN_HEIGHT = 60     # ignore tiny boxes — crouching near camera looks wide but is small
+PRONE_CONFIRM_N  = 8      # must be wide for this many consecutive frames
+
+_prone_history = {}       # track_id -> deque of bool
+
+def check_prone(track_id, x1, y1, x2, y2):
     w, h = (x2 - x1), (y2 - y1)
-    if h > 0 and (w / h) > 1.6:
+    if track_id not in _prone_history:
+        _prone_history[track_id] = deque(maxlen=PRONE_CONFIRM_N)
+    is_wide = (h > PRONE_MIN_HEIGHT) and (h > 0) and (w / h) > PRONE_RATIO
+    _prone_history[track_id].append(is_wide)
+    hist = _prone_history[track_id]
+    if len(hist) == PRONE_CONFIRM_N and all(hist):
         return "PERSON DOWN"
     return None
 
@@ -412,6 +421,12 @@ def parse_lstm_confidence(lstm_verdict: str) -> float:
 def show_video(video_source):
     root.withdraw()
 
+    # If the user closes/exits the tk window while video is running, stop gracefully
+    stop_flag = [False]
+    def _on_root_close():
+        stop_flag[0] = True
+    root.protocol("WM_DELETE_WINDOW", _on_root_close)
+
     # Robust webcam fallback chain
     if video_source == 0:
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -429,11 +444,11 @@ def show_video(video_source):
         root.deiconify()
         return
 
-    # Resolution lock for webcam; buffer tuning for both
+    # Resolution lock for webcam only; buffer tuning applies to both
     if video_source == 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Set buffer to 1 for lowest latency
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
     # Tracking state
     track_buffers         = {}
@@ -450,6 +465,7 @@ def show_video(video_source):
     track_bbox_history    = {}
     track_wrist_history   = {}
     track_last_lm         = {}
+    track_active_flags    = {}  # all active flags per track — drives side panel
 
     alert_sent    = False
     normal_frames = 0
@@ -478,8 +494,7 @@ def show_video(video_source):
         finally:
             processing_tracks.discard(t_id)
 
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    stop_flag = [False]
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -512,12 +527,9 @@ def show_video(video_source):
                     break
                 continue
 
-            # 🏎️ YOLO Performance: Run every 2 frames + Half Precision
-            if frame_count % 2 == 0 or 'results' not in locals():
-                results = yolo_model.track(frame, persist=True, half=True,
-                                           classes=[0]+WEAPON_CLASSES, verbose=False)
-            
-            # (Optional) HUD Diagnostic: time.time() vs prev_time for loop speed
+            results = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
+            # FIX 9: Remove duplicate annotated_frame = frame.copy() that was overwriting annotations
+            # (original had this line AFTER writing weapon boxes — erasing them)
 
             weapon_boxes = []
             person_boxes = []
@@ -593,7 +605,7 @@ def show_video(video_source):
                                 track_pose_buffers[track_id].append(pose_vec)
 
                                 if (len(track_buffers[track_id]) == SEQUENCE_LENGTH and
-                                        (frame_count + track_id) % 6 == 0 and # Reduce LSTM frequency
+                                        (frame_count + track_id) % 3 == 0 and
                                         track_id not in processing_tracks):
                                     processing_tracks.add(track_id)
                                     X_img  = np.expand_dims(np.array(track_buffers[track_id]),      axis=0)
@@ -612,112 +624,209 @@ def show_video(video_source):
                         weapon_flag = weapon_near_person(x1, y1, x2, y2, weapon_boxes)
 
                         fall_flag   = check_fall(track_id, x1, y1, x2, y2, curr_time, track_bbox_history)
-                        prone_flag  = check_prone(x1, y1, x2, y2)
+                        prone_flag  = check_prone(track_id, x1, y1, x2, y2)
                         flail_flag  = check_arm_flail(track_id, current_lm, track_wrist_history)
 
-                        # FIX 11: Use safe parser instead of raw string slicing
+                        # ── Collect ALL active flags for this track ───────────
                         lstm_verdict = track_status.get(track_id, "Tracking...")
                         rule_flag    = track_rule_flag.get(track_id)
                         lstm_conf    = parse_lstm_confidence(lstm_verdict)
 
-                        # Time-of-Day Sensitive Threshold
-                        time_mult    = get_time_multiplier()
-                        is_lstm_sus  = "SUSPICIOUS" in lstm_verdict and lstm_conf > (0.70 / time_mult)
-                        is_rule_sus  = rule_flag is not None
+                        time_mult   = get_time_multiplier()
+                        is_lstm_sus = "SUSPICIOUS" in lstm_verdict and lstm_conf > (0.70 / time_mult)
+                        is_rule_sus = rule_flag is not None
 
-                        if weapon_flag and (is_lstm_sus or is_rule_sus):
-                            display_text = f"CRITICAL | WEAPON + {rule_flag or 'INTENT'}"
-                            box_color    = (0, 0, 255)
-                        elif weapon_flag:
-                            display_text = "WEAPON DETECTED"
-                            box_color    = (0, 40, 255)
-                        elif is_lstm_sus and is_rule_sus:
-                            display_text = f"THREAT | {rule_flag}"
-                            box_color    = (0, 0, 255)
-                        elif fall_flag:
-                            display_text = fall_flag
-                            box_color    = (0, 0, 255)
-                        elif prone_flag:
-                            display_text = prone_flag
-                            box_color    = (0, 0, 200)
-                        elif vel_flag:
-                            display_text = vel_flag
-                            box_color    = (0, 140, 255)
-                        elif flail_flag:
-                            display_text = flail_flag
-                            box_color    = (0, 80, 255)
-                        elif is_lstm_sus:
-                            display_text = lstm_verdict
-                            box_color    = (0, 80, 255)
-                        elif is_rule_sus:
-                            display_text = f"OVERRIDE: {rule_flag}"
-                            box_color    = (0, 140, 255)
+                        active_flags = []
+                        if weapon_flag      and _toggle_vars["WEAPON"].get():      active_flags.append("WEAPON")
+                        if is_lstm_sus      and _toggle_vars["INTENT"].get():      active_flags.append(f"INTENT {lstm_conf*100:.0f}%")
+                        if is_rule_sus      and _toggle_vars["POSE RULES"].get():  active_flags.append(rule_flag)
+                        if fall_flag        and _toggle_vars["FALL"].get():        active_flags.append("FALL")
+                        if prone_flag       and _toggle_vars["PERSON DOWN"].get(): active_flags.append("PERSON DOWN")
+                        if vel_flag         and _toggle_vars["RAPID MOVE"].get():  active_flags.append("RAPID MOVE")
+                        if flail_flag       and _toggle_vars["FLAILING"].get():    active_flags.append("FLAILING")
+                        if loiter_flag      and _toggle_vars["LOITERING"].get():   active_flags.append(loiter_flag)
+
+                        # Severity → box border colour (worst wins for the bbox only)
+                        if weapon_flag or fall_flag:
+                            box_color = (0, 0, 255)          # red
+                        elif is_lstm_sus or is_rule_sus:
+                            box_color = (0, 80, 255)         # orange-red
+                        elif vel_flag or flail_flag or prone_flag:
+                            box_color = (0, 140, 255)        # orange
                         elif loiter_flag:
-                            display_text = loiter_flag
-                            box_color    = (180, 100, 30)
+                            box_color = (30, 100, 180)       # amber
                         else:
-                            display_text = lstm_verdict
-                            box_color    = (0, 220, 0)
+                            box_color = (0, 200, 0)          # green — normal
 
-                        banner_w = min(480, frame.shape[1] - x1)
-                        cv2.rectangle(annotated_frame, (x1, y1 - 42), (x1 + banner_w, y1), box_color, -1)
-                        cv2.putText(annotated_frame, f"ID:{track_id} | {display_text}",
-                                    (x1 + 5, y1 - 12), font, 0.65, (255, 255, 255), 2)
+                        # Small clean label directly on bounding box (ID + worst flag only)
+                        short_label = f"ID:{track_id}"
+                        if active_flags:
+                            short_label += f" | {active_flags[0]}"
+                        cv2.rectangle(annotated_frame, (x1, y1 - 28), (x1 + 260, y1), box_color, -1)
+                        cv2.putText(annotated_frame, short_label,
+                                    (x1 + 4, y1 - 8), font, 0.55, (255, 255, 255), 1)
 
-                        # FIX 12: Alert de-dupe logic corrected — use per-track id to prevent
-                        #          cross-track suppression. Also log full confident LSTM events too.
-                        is_alert = ("CRITICAL" in display_text or "WEAPON" in display_text or
-                                    (is_lstm_sus and lstm_conf > LSTM_CONFIDENCE_THRESHOLD) or
-                                    fall_flag is not None)
+                        # Store flags for side panel (drawn after all persons processed)
+                        track_active_flags[track_id] = active_flags
+
+                        # Alert trigger
+                        is_alert = (weapon_flag or fall_flag or
+                                    (is_lstm_sus and lstm_conf > LSTM_CONFIDENCE_THRESHOLD))
                         if is_alert:
                             if not alert_sent:
                                 alert_sent = True
                                 try:
-                                    log_event(display_text, max(lstm_conf, 0.85))
+                                    log_event(" | ".join(active_flags) or "SUSPICIOUS",
+                                              max(lstm_conf, 0.85))
                                 except Exception:
                                     pass
-                            cv2.putText(annotated_frame, "THREAT DETECTED",
-                                        (30, frame.shape[0] - 40), font, 2.0, (0, 0, 255), 5)
+                            cv2.putText(annotated_frame, "! THREAT DETECTED !",
+                                        (30, frame.shape[0] - 40), font, 1.6, (0, 0, 255), 4)
                             normal_frames = 0
                         else:
                             normal_frames += 1
                             if normal_frames > 90:
                                 alert_sent = False
 
-            # Proximity alert
+            # ── Proximity alert (on raw frame before resize) ──────────────
             conflict_ids = check_proximity(person_boxes, person_ids, frame.shape[1], frame.shape[0])
-            if conflict_ids:
+            if conflict_ids and _toggle_vars["PROXIMITY"].get():
                 cv2.putText(annotated_frame,
                             f"CONFLICT ZONE: {len(conflict_ids)} PERSONS",
-                            (30, frame.shape[0] - 80), font, 1.2, (0, 100, 255), 3)
+                            (30, frame.shape[0] - 80), font, 1.0, (0, 100, 255), 2)
 
-            # Scale to 480p for display (significant rendering speedup)
-            DISPLAY_HEIGHT = 480
+            # ── Scale video to 720p ───────────────────────────────────────
+            DISPLAY_HEIGHT = 720
+            PANEL_W        = 280          # side panel width in pixels
             orig_h, orig_w = annotated_frame.shape[:2]
             scale    = DISPLAY_HEIGHT / max(orig_h, 1)
             scaled_w = int(orig_w * scale)
-            display_frame = cv2.resize(annotated_frame, (scaled_w, DISPLAY_HEIGHT),
-                                       interpolation=cv2.INTER_LINEAR)
+            video_frame = cv2.resize(annotated_frame, (scaled_w, DISPLAY_HEIGHT),
+                                     interpolation=cv2.INTER_LINEAR)
 
-            # HUD
+            # ── Build side panel canvas ───────────────────────────────────
+            panel = np.zeros((DISPLAY_HEIGHT, PANEL_W, 3), dtype=np.uint8)
+            panel[:] = (18, 18, 24)   # very dark background
+
+            # Panel header
+            cv2.rectangle(panel, (0, 0), (PANEL_W, 50), (10, 10, 18), -1)
+            cv2.putText(panel, "ACTIVE TRACKS", (10, 18),
+                        font, 0.45, (100, 180, 255), 1)
+            cv2.putText(panel, f"{len(track_active_flags)} person(s) tracked",
+                        (10, 38), font, 0.38, (120, 120, 140), 1)
+            cv2.line(panel, (0, 50), (PANEL_W, 50), (40, 40, 55), 1)
+
+            # One card per tracked person
+            ROW_H       = 28   # height per flag line
+            CARD_PAD    = 8    # vertical gap between cards
+            card_top    = 58
+
+            # Severity colour map for flag pills
+            FLAG_COLORS = {
+                "WEAPON":      (40,  40,  220),
+                "FALL":        (40,  40,  220),
+                "INTENT":      (40,  100, 220),
+                "RAISED ARMS": (40,  120, 200),
+                "LUNGE":       (40,  120, 200),
+                "STRIKING":    (40,  120, 200),
+                "AGGRESSIVE":  (40,  120, 200),
+                "RAPID MOVE":  (30,  160, 220),
+                "FLAILING":    (30,  140, 200),
+                "PERSON DOWN": (30,  80,  200),
+                "LOITERING":   (60,  110, 160),
+                "CONFLICT":    (60,  100, 200),
+            }
+
+            def flag_color(f):
+                for key, col in FLAG_COLORS.items():
+                    if key in f.upper():
+                        return col
+                return (60, 60, 80)
+
+            # Remove stale tracks (IDs no longer in current frame)
+            active_ids_this_frame = set(person_ids)
+            stale = [tid for tid in track_active_flags if tid not in active_ids_this_frame]
+            for tid in stale:
+                del track_active_flags[tid]
+
+            for tid in sorted(track_active_flags.keys()):
+                flags = track_active_flags[tid]
+
+                # How many lines does this card need?
+                n_lines  = max(len(flags), 1)
+                card_h   = 22 + n_lines * ROW_H + 6
+
+                if card_top + card_h > DISPLAY_HEIGHT - 10:
+                    break   # panel full
+
+                # Card background
+                has_critical = any(k in " ".join(flags).upper()
+                                   for k in ("WEAPON", "FALL", "INTENT"))
+                card_bg = (30, 18, 18) if has_critical else (22, 24, 32)
+                cv2.rectangle(panel,
+                              (6, card_top),
+                              (PANEL_W - 6, card_top + card_h),
+                              card_bg, -1)
+                # Left accent bar — severity colour
+                accent = (0, 0, 200) if has_critical else (50, 100, 180)
+                cv2.rectangle(panel,
+                              (6, card_top),
+                              (10, card_top + card_h),
+                              accent, -1)
+
+                # Track ID header
+                cv2.putText(panel, f"ID: {tid}",
+                            (16, card_top + 16),
+                            font, 0.48, (220, 220, 240), 1)
+
+                if not flags:
+                    cv2.putText(panel, "Normal",
+                                (16, card_top + 16 + ROW_H),
+                                font, 0.4, (80, 180, 80), 1)
+                else:
+                    for fi, flag_text in enumerate(flags):
+                        fy = card_top + 20 + (fi + 1) * ROW_H
+                        # Pill background
+                        pill_col = flag_color(flag_text)
+                        pill_x2  = min(16 + 8 + len(flag_text) * 7 + 8, PANEL_W - 10)
+                        cv2.rectangle(panel,
+                                      (16, fy - 13),
+                                      (pill_x2, fy + 5),
+                                      pill_col, -1)
+                        cv2.putText(panel, flag_text,
+                                    (20, fy),
+                                    font, 0.4, (255, 255, 255), 1)
+
+                # Thin separator line at card bottom
+                cv2.line(panel,
+                         (10, card_top + card_h),
+                         (PANEL_W - 10, card_top + card_h),
+                         (38, 38, 50), 1)
+
+                card_top += card_h + CARD_PAD
+
+            # ── Compose final display: video | panel ─────────────────────
+            display_frame = np.hstack([video_frame, panel])
             h_f, w_f = display_frame.shape[:2]
-            overlay  = display_frame.copy()
-            cv2.rectangle(overlay, (0, 0), (w_f, 90), (0, 0, 0), -1)
+
+            # ── Top HUD bar ───────────────────────────────────────────────
+            overlay = display_frame.copy()
+            cv2.rectangle(overlay, (0, 0), (scaled_w, 90), (0, 0, 0), -1)
             display_frame = cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0)
 
-            # FIX 13: Show elapsed time in HUD instead of stale t1 delta
             elapsed = time.time() - start_time
             cv2.putText(display_frame, "HYBRID AI  |  YOLO + Pose + LSTM",
-                        (10, 50), font, 0.9, (0, 255, 255), 2)
+                        (10, 34), font, 0.75, (0, 255, 255), 2)
             cv2.putText(display_frame,
-                        f"FPS: {fps:.1f}  |  Elapsed: {int(elapsed)}s",
-                        (10, 80), font, 0.7, (200, 200, 200), 2)
+                        f"FPS: {fps:.1f}  |  Elapsed: {int(elapsed)}s  |  Tracks: {len(track_active_flags)}",
+                        (10, 68), font, 0.55, (180, 180, 180), 1)
 
-            # STOP button
-            bx1, by1, bx2, by2 = w_f - 130, 12, w_f - 10, 60
-            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 0, 180), -1)
-            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
-            cv2.putText(display_frame, 'STOP', (bx1 + 14, by2 - 12), font, 1.0, (255, 255, 255), 2)
+            # ── STOP button ───────────────────────────────────────────────
+            bx1, by1, bx2, by2 = scaled_w - 120, 14, scaled_w - 10, 56
+            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 0, 160), -1)
+            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+            cv2.putText(display_frame, 'STOP', (bx1 + 18, by2 - 12),
+                        font, 0.8, (255, 255, 255), 2)
 
             cv2.setMouseCallback(win_name, mouse_callback, (h_f, w_f))
             cv2.imshow(win_name, display_frame)
@@ -730,11 +839,63 @@ def show_video(video_source):
         cap.release()
         executor.shutdown(wait=False)
         cv2.destroyAllWindows()
-        root.deiconify()
+        try:
+            # Restore normal close behaviour and show the launcher again
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
+            root.deiconify()
+        except Exception:
+            pass  # root was already destroyed via Exit button — that's fine
 
 
 # =============================================================================
-# GUI Buttons
+# GUI — main launcher window
+
+# BooleanVars for each toggle — created after root exists
+_toggle_vars = {}   # key -> tk.BooleanVar
+
+def open_settings():
+    """Small floating window to enable/disable each detection type."""
+    win = tk.Toplevel(root)
+    win.title("Detection Settings")
+    win.configure(bg="#0d1117")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+
+    tk.Label(win, text="Detection Toggles", font=("Helvetica", 14, "bold"),
+             bg="#0d1117", fg="white").pack(pady=(14, 4))
+    tk.Label(win, text="Uncheck to disable a detection type",
+             font=("Helvetica", 10), bg="#0d1117", fg="#8b949e").pack(pady=(0, 10))
+
+    frame = tk.Frame(win, bg="#0d1117")
+    frame.pack(padx=20, pady=4)
+
+    LABELS = {
+        "WEAPON":      "Weapon detection",
+        "INTENT":      "LSTM suspicious intent",
+        "POSE RULES":  "Pose rules (raised arms, lunge…)",
+        "FALL":        "Fall detection",
+        "PERSON DOWN": "Person down (prone)",
+        "RAPID MOVE":  "Rapid movement",
+        "FLAILING":    "Arm flailing",
+        "LOITERING":   "Loitering",
+        "PROXIMITY":   "Proximity / conflict zone",
+    }
+
+    for key, label in LABELS.items():
+        var = _toggle_vars[key]
+        cb = tk.Checkbutton(
+            frame, text=label, variable=var,
+            font=("Helvetica", 11), bg="#0d1117", fg="white",
+            selectcolor="#1f6feb", activebackground="#0d1117",
+            activeforeground="white", anchor="w"
+        )
+        cb.pack(fill="x", pady=3)
+
+    tk.Button(win, text="Close", command=win.destroy,
+              width=14, font=("Helvetica", 11), bg="#21262d",
+              fg="#8b949e", relief="flat", cursor="hand2").pack(pady=12)
+
+
 def upload_video():
     f = askopenfilename(initialdir=SCRIPT_DIR, title='Select video',
                         filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov"), ("All", "*.*")])
@@ -743,6 +904,18 @@ def upload_video():
 
 def use_webcam():
     show_video(0)
+
+def do_exit():
+    """Safe exit: ensures all threads and windows close immediately."""
+    try:
+        # Signal executor to stop if possible
+        if 'executor' in locals():
+            executor.shutdown(wait=False)
+        root.quit()
+        root.destroy()
+        sys.exit(0)
+    except Exception:
+        os._exit(0) # Forced exit if tkinter is stuck
 
 btn_frame = tk.Frame(root, bg="#0d1117")
 btn_frame.pack(pady=30)
@@ -755,9 +928,17 @@ tk.Button(btn_frame, text="  Upload Video", command=upload_video,
           **btn_style).pack(pady=10)
 tk.Button(btn_frame, text="  Use Webcam", command=use_webcam,
           **btn_style).pack(pady=10)
-tk.Button(btn_frame, text="Exit", command=root.destroy,
+tk.Button(btn_frame, text="  Detection Settings", command=open_settings,
+          width=28, font=("Helvetica", 14, "bold"), bg="#238636",
+          fg="white", relief="flat", activebackground="#2ea043",
+          cursor="hand2").pack(pady=10)
+tk.Button(btn_frame, text="Exit", command=do_exit,
           width=28, font=("Helvetica", 14), bg="#21262d",
           fg="#8b949e", relief="flat", cursor="hand2").pack(pady=10)
+
+# Initialise BooleanVars now that root exists
+for k, v in DETECTION_TOGGLES.items():
+    _toggle_vars[k] = tk.BooleanVar(value=v)
 
 # CLI support
 if len(sys.argv) > 1:
