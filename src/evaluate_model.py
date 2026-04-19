@@ -262,7 +262,7 @@ def run_evaluation():
 
     summary = f"""# Model Performance Report
 
-## Real Evaluation Results (not synthetic)
+## Real Evaluation Results 
 All metrics below are computed from actual model inference on {len(all_seqs)} test sequences.
 
 ## Metrics Summary

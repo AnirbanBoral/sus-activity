@@ -7,6 +7,5 @@ tqdm>=4.60.0
 matplotlib>=3.5.0
 mediapipe>=0.10.0
 ultralytics>=8.0.0
-scikit-learn
 seaborn
-matplotlib
+

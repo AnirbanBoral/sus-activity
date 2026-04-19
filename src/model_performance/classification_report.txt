@@ -1,0 +1,13 @@
+Classification Report
+========================================
+
+              precision    recall  f1-score   support
+
+      Normal       0.88      0.95      0.91       300
+  Suspicious       0.94      0.87      0.91       300
+
+    accuracy                           0.91       600
+   macro avg       0.91      0.91      0.91       600
+weighted avg       0.91      0.91      0.91       600
+
+ROC-AUC Score: 0.9719
