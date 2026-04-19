@@ -4,6 +4,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import sys
 import tkinter as tk
 from tkinter.filedialog import askopenfilename
+from tkinter import simpledialog
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
@@ -975,6 +976,21 @@ tk.Button(btn_frame, text="  Upload Video", command=upload_video,
           **btn_style).pack(pady=10)
 tk.Button(btn_frame, text="  Use Webcam", command=use_webcam,
           **btn_style).pack(pady=10)
+
+def use_cctv():
+    url = simpledialog.askstring(
+        "CCTV Stream",
+        "Enter RTSP URL:\n(e.g. rtsp://admin:pass@192.168.1.64:554/stream1)",
+        parent=root
+    )
+    if url and url.strip():
+        show_video(url.strip())
+
+tk.Button(btn_frame, text="  Connect CCTV Stream", command=use_cctv,
+          width=28, font=("Helvetica", 16, "bold"), bg="#6e40c9",
+          fg="white", relief="flat", activebackground="#8957e5",
+          cursor="hand2").pack(pady=10)
+
 tk.Button(btn_frame, text="  Detection Settings", command=open_settings,
           width=28, font=("Helvetica", 14, "bold"), bg="#238636",
           fg="white", relief="flat", activebackground="#2ea043",
