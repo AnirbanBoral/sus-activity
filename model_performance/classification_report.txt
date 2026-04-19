@@ -6,3 +6,5 @@
     accuracy                           0.91       200
    macro avg       0.90      0.91      0.91       200
 weighted avg       0.91      0.91      0.91       200
+
+ROC-AUC Score: 0.8013
