@@ -466,9 +466,14 @@ def show_video(video_source):
     track_wrist_history   = {}
     track_last_lm         = {}
     track_active_flags    = {}  # all active flags per track — drives side panel
+    flag_first_seen       = {}  # track_id -> {flag -> timestamp} for age display
 
     alert_sent    = False
     normal_frames = 0
+    flash_frames  = 0    # counts down when a new alert fires — drives bbox flash
+    event_count   = 0    # total events logged — shown in panel footer
+
+    fps_history = deque(maxlen=30)   # smooth FPS over last 30 frames
 
     frame_count = 0
     start_time  = time.time()
@@ -517,7 +522,9 @@ def show_video(video_source):
                 break
 
             curr_time = time.time()
-            fps       = 1 / max(curr_time - prev_time, 0.0001)
+            raw_fps   = 1 / max(curr_time - prev_time, 0.0001)
+            fps_history.append(raw_fps)
+            fps       = sum(fps_history) / len(fps_history)   # smoothed
             prev_time = curr_time
             frame_count += 1
             annotated_frame = frame.copy()
@@ -649,27 +656,44 @@ def show_video(video_source):
                         if flail_flag       and _toggle_vars["FLAILING"].get():    active_flags.append("FLAILING")
                         if loiter_flag      and _toggle_vars["LOITERING"].get():   active_flags.append(loiter_flag)
 
-                        # Severity → box border colour (worst wins for the bbox only)
-                        if weapon_flag or fall_flag:
-                            box_color = (0, 0, 255)          # red
-                        elif is_lstm_sus or is_rule_sus:
-                            box_color = (0, 80, 255)         # orange-red
-                        elif vel_flag or flail_flag or prone_flag:
-                            box_color = (0, 140, 255)        # orange
-                        elif loiter_flag:
-                            box_color = (30, 100, 180)       # amber
-                        else:
-                            box_color = (0, 200, 0)          # green — normal
+                        # ── Track when each flag first appeared ───────────────
+                        if track_id not in flag_first_seen:
+                            flag_first_seen[track_id] = {}
+                        for f in active_flags:
+                            if f not in flag_first_seen[track_id]:
+                                flag_first_seen[track_id][f] = curr_time
+                        # Clear timestamps for flags that are no longer active
+                        gone = [f for f in flag_first_seen[track_id] if f not in active_flags]
+                        for f in gone:
+                            del flag_first_seen[track_id][f]
 
-                        # Small clean label directly on bounding box (ID + worst flag only)
-                        short_label = f"ID:{track_id}"
+                        # Severity → box border colour
+                        if weapon_flag or fall_flag:
+                            box_color = (0, 0, 255)
+                        elif is_lstm_sus or is_rule_sus:
+                            box_color = (0, 80, 255)
+                        elif vel_flag or flail_flag or prone_flag:
+                            box_color = (0, 140, 255)
+                        elif loiter_flag:
+                            box_color = (30, 100, 180)
+                        else:
+                            box_color = (0, 200, 0)
+
+                        # Flash: alternate box colour with white when alert is fresh
+                        draw_color = box_color
+                        if flash_frames > 0 and (flash_frames % 6) < 3:
+                            draw_color = (255, 255, 255)
+
+                        # Bbox label — show "Normal" cleanly instead of blank/Tracking...
                         if active_flags:
-                            short_label += f" | {active_flags[0]}"
-                        cv2.rectangle(annotated_frame, (x1, y1 - 28), (x1 + 260, y1), box_color, -1)
+                            short_label = f"ID:{track_id} | {active_flags[0]}"
+                        else:
+                            short_label = f"ID:{track_id}  Normal"
+                        cv2.rectangle(annotated_frame, (x1, y1 - 28), (x1 + 260, y1), draw_color, -1)
                         cv2.putText(annotated_frame, short_label,
                                     (x1 + 4, y1 - 8), font, 0.55, (255, 255, 255), 1)
 
-                        # Store flags for side panel (drawn after all persons processed)
+                        # Store flags for side panel
                         track_active_flags[track_id] = active_flags
 
                         # Alert trigger
@@ -677,7 +701,9 @@ def show_video(video_source):
                                     (is_lstm_sus and lstm_conf > LSTM_CONFIDENCE_THRESHOLD))
                         if is_alert:
                             if not alert_sent:
-                                alert_sent = True
+                                alert_sent   = True
+                                flash_frames = 40   # start flash
+                                event_count += 1
                                 try:
                                     log_event(" | ".join(active_flags) or "SUSPICIOUS",
                                               max(lstm_conf, 0.85))
@@ -691,6 +717,9 @@ def show_video(video_source):
                             if normal_frames > 90:
                                 alert_sent = False
 
+            if flash_frames > 0:
+                flash_frames -= 1
+
             # ── Proximity alert (on raw frame before resize) ──────────────
             conflict_ids = check_proximity(person_boxes, person_ids, frame.shape[1], frame.shape[0])
             if conflict_ids and _toggle_vars["PROXIMITY"].get():
@@ -700,31 +729,29 @@ def show_video(video_source):
 
             # ── Scale video to 720p ───────────────────────────────────────
             DISPLAY_HEIGHT = 720
-            PANEL_W        = 280          # side panel width in pixels
+            PANEL_W        = 290
             orig_h, orig_w = annotated_frame.shape[:2]
             scale    = DISPLAY_HEIGHT / max(orig_h, 1)
             scaled_w = int(orig_w * scale)
             video_frame = cv2.resize(annotated_frame, (scaled_w, DISPLAY_HEIGHT),
                                      interpolation=cv2.INTER_LINEAR)
 
-            # ── Build side panel canvas ───────────────────────────────────
+            # ── Build side panel ──────────────────────────────────────────
             panel = np.zeros((DISPLAY_HEIGHT, PANEL_W, 3), dtype=np.uint8)
-            panel[:] = (18, 18, 24)   # very dark background
+            panel[:] = (18, 18, 24)
 
-            # Panel header
-            cv2.rectangle(panel, (0, 0), (PANEL_W, 50), (10, 10, 18), -1)
+            # Header
+            cv2.rectangle(panel, (0, 0), (PANEL_W, 52), (10, 10, 18), -1)
             cv2.putText(panel, "ACTIVE TRACKS", (10, 18),
                         font, 0.45, (100, 180, 255), 1)
-            cv2.putText(panel, f"{len(track_active_flags)} person(s) tracked",
+            cv2.putText(panel, f"{len(track_active_flags)} person(s) in frame",
                         (10, 38), font, 0.38, (120, 120, 140), 1)
-            cv2.line(panel, (0, 50), (PANEL_W, 50), (40, 40, 55), 1)
+            cv2.line(panel, (0, 52), (PANEL_W, 52), (40, 40, 55), 1)
 
-            # One card per tracked person
-            ROW_H       = 28   # height per flag line
-            CARD_PAD    = 8    # vertical gap between cards
-            card_top    = 58
+            ROW_H    = 26
+            CARD_PAD = 6
+            card_top = 60
 
-            # Severity colour map for flag pills
             FLAG_COLORS = {
                 "WEAPON":      (40,  40,  220),
                 "FALL":        (40,  40,  220),
@@ -739,90 +766,98 @@ def show_video(video_source):
                 "LOITERING":   (60,  110, 160),
                 "CONFLICT":    (60,  100, 200),
             }
-
             def flag_color(f):
                 for key, col in FLAG_COLORS.items():
                     if key in f.upper():
                         return col
                 return (60, 60, 80)
 
-            # Remove stale tracks (IDs no longer in current frame)
+            # Remove stale tracks
             active_ids_this_frame = set(person_ids)
-            stale = [tid for tid in track_active_flags if tid not in active_ids_this_frame]
-            for tid in stale:
+            for tid in [t for t in list(track_active_flags) if t not in active_ids_this_frame]:
                 del track_active_flags[tid]
 
             for tid in sorted(track_active_flags.keys()):
-                flags = track_active_flags[tid]
+                flags  = track_active_flags[tid]
+                lstm_v = track_status.get(tid, "")
+                conf   = parse_lstm_confidence(lstm_v)
 
-                # How many lines does this card need?
-                n_lines  = max(len(flags), 1)
-                card_h   = 22 + n_lines * ROW_H + 6
+                n_lines = max(len(flags), 1)
+                card_h  = 18 + 14 + n_lines * ROW_H + 8
 
-                if card_top + card_h > DISPLAY_HEIGHT - 10:
-                    break   # panel full
+                if card_top + card_h > DISPLAY_HEIGHT - 42:
+                    break
 
-                # Card background
                 has_critical = any(k in " ".join(flags).upper()
                                    for k in ("WEAPON", "FALL", "INTENT"))
                 card_bg = (30, 18, 18) if has_critical else (22, 24, 32)
-                cv2.rectangle(panel,
-                              (6, card_top),
-                              (PANEL_W - 6, card_top + card_h),
-                              card_bg, -1)
-                # Left accent bar — severity colour
+                cv2.rectangle(panel, (6, card_top), (PANEL_W - 6, card_top + card_h), card_bg, -1)
+
                 accent = (0, 0, 200) if has_critical else (50, 100, 180)
-                cv2.rectangle(panel,
-                              (6, card_top),
-                              (10, card_top + card_h),
-                              accent, -1)
+                cv2.rectangle(panel, (6, card_top), (10, card_top + card_h), accent, -1)
 
-                # Track ID header
+                # ID row
                 cv2.putText(panel, f"ID: {tid}",
-                            (16, card_top + 16),
-                            font, 0.48, (220, 220, 240), 1)
+                            (14, card_top + 14), font, 0.46, (220, 220, 240), 1)
 
+                # Confidence bar
+                bar_x, bar_y = 14, card_top + 20
+                bar_w, bar_h = PANEL_W - 28, 8
+                cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 40, 50), -1)
+                fill = int(bar_w * conf)
+                if fill > 0:
+                    bar_col = (0, 0, 200) if conf > 0.70 else (0, 160, 200) if conf > 0.40 else (0, 180, 80)
+                    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + fill, bar_y + bar_h), bar_col, -1)
+                cv2.putText(panel, f"{conf*100:.0f}%",
+                            (bar_x + bar_w + 3, bar_y + 7), font, 0.3, (160, 160, 180), 1)
+
+                # Flag pills with age
                 if not flags:
-                    cv2.putText(panel, "Normal",
-                                (16, card_top + 16 + ROW_H),
-                                font, 0.4, (80, 180, 80), 1)
+                    fy = card_top + 20 + ROW_H
+                    cv2.putText(panel, "Normal", (14, fy), font, 0.38, (60, 180, 60), 1)
                 else:
                     for fi, flag_text in enumerate(flags):
-                        fy = card_top + 20 + (fi + 1) * ROW_H
-                        # Pill background
+                        fy       = card_top + 20 + 14 + (fi + 1) * ROW_H
                         pill_col = flag_color(flag_text)
-                        pill_x2  = min(16 + 8 + len(flag_text) * 7 + 8, PANEL_W - 10)
-                        cv2.rectangle(panel,
-                                      (16, fy - 13),
-                                      (pill_x2, fy + 5),
-                                      pill_col, -1)
-                        cv2.putText(panel, flag_text,
-                                    (20, fy),
-                                    font, 0.4, (255, 255, 255), 1)
+                        pill_x2  = min(14 + len(flag_text) * 7 + 10, PANEL_W - 36)
+                        cv2.rectangle(panel, (14, fy - 12), (pill_x2, fy + 4), pill_col, -1)
+                        cv2.putText(panel, flag_text, (18, fy), font, 0.37, (255, 255, 255), 1)
 
-                # Thin separator line at card bottom
-                cv2.line(panel,
-                         (10, card_top + card_h),
-                         (PANEL_W - 10, card_top + card_h),
-                         (38, 38, 50), 1)
+                        # Age label
+                        age = curr_time - flag_first_seen.get(tid, {}).get(flag_text, curr_time)
+                        if age >= 1:
+                            cv2.putText(panel, f"{int(age)}s", (pill_x2 + 4, fy),
+                                        font, 0.32, (140, 140, 160), 1)
 
+                cv2.line(panel, (10, card_top + card_h),
+                         (PANEL_W - 10, card_top + card_h), (38, 38, 50), 1)
                 card_top += card_h + CARD_PAD
 
-            # ── Compose final display: video | panel ─────────────────────
+            # Panel footer — event counter
+            footer_y = DISPLAY_HEIGHT - 30
+            cv2.rectangle(panel, (0, footer_y - 14), (PANEL_W, DISPLAY_HEIGHT), (10, 10, 18), -1)
+            cv2.line(panel, (0, footer_y - 14), (PANEL_W, footer_y - 14), (40, 40, 55), 1)
+            ev_col = (80, 80, 200) if event_count == 0 else (80, 80, 255)
+            cv2.putText(panel, f"Events logged: {event_count}",
+                        (10, footer_y + 4), font, 0.38, ev_col, 1)
+            cv2.putText(panel, "C = clear alerts",
+                        (10, footer_y + 18), font, 0.32, (80, 80, 100), 1)
+
+            # ── Compose display ───────────────────────────────────────────
             display_frame = np.hstack([video_frame, panel])
             h_f, w_f = display_frame.shape[:2]
 
             # ── Top HUD bar ───────────────────────────────────────────────
             overlay = display_frame.copy()
-            cv2.rectangle(overlay, (0, 0), (scaled_w, 90), (0, 0, 0), -1)
-            display_frame = cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0)
+            cv2.rectangle(overlay, (0, 0), (scaled_w, 78), (0, 0, 0), -1)
+            display_frame = cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0)
 
             elapsed = time.time() - start_time
             cv2.putText(display_frame, "HYBRID AI  |  YOLO + Pose + LSTM",
-                        (10, 34), font, 0.75, (0, 255, 255), 2)
+                        (10, 30), font, 0.7, (0, 255, 255), 2)
             cv2.putText(display_frame,
-                        f"FPS: {fps:.1f}  |  Elapsed: {int(elapsed)}s  |  Tracks: {len(track_active_flags)}",
-                        (10, 68), font, 0.55, (180, 180, 180), 1)
+                        f"FPS: {fps:.1f}  |  {int(elapsed)}s elapsed  |  Tracks: {len(track_active_flags)}",
+                        (10, 62), font, 0.5, (170, 170, 170), 1)
 
             # ── STOP button ───────────────────────────────────────────────
             _bx1 = scaled_w - 120
@@ -835,11 +870,20 @@ def show_video(video_source):
             cv2.rectangle(display_frame, (_bx1, _by1), (_bx2, _by2), (255, 255, 255), 1)
             cv2.putText(display_frame, 'STOP', (_bx1 + 18, _by2 - 12),
                         font, 0.8, (255, 255, 255), 2)
+
             cv2.imshow(win_name, display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q') or stop_flag[0]:
                 print("[INFO] Detection stopped.")
                 break
+            elif key == ord('c') or key == ord('C'):
+                alert_sent   = False
+                flash_frames = 0
+                normal_frames = 0
+                track_active_flags.clear()
+                flag_first_seen.clear()
+                print("[INFO] Alerts cleared.")
+
 
     finally:
         cap.release()
