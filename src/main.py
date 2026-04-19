@@ -496,16 +496,19 @@ def show_video(video_source):
 
     font = cv2.FONT_HERSHEY_SIMPLEX
 
+    # Button coords stored in a mutable container so the callback always sees current values
+    btn_coords = [0, 0, 0, 0]   # [bx1, by1, bx2, by2] — updated each frame
+
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            h_w, w_w = param
-            if (w_w - 130) <= x <= (w_w - 10) and 12 <= y <= 60:
+            bx1, by1, bx2, by2 = btn_coords
+            if bx1 <= x <= bx2 and by1 <= y <= by2:
                 stop_flag[0] = True
 
     win_name = 'Suspicious Activity Detection'
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_name, 1280, 720)
-    cv2.setMouseCallback(win_name, mouse_callback, (720, 1280))
+    cv2.resizeWindow(win_name, 1560, 720)   # wider to fit video + panel
+    cv2.setMouseCallback(win_name, mouse_callback)
 
     try:
         while True:
@@ -822,13 +825,16 @@ def show_video(video_source):
                         (10, 68), font, 0.55, (180, 180, 180), 1)
 
             # ── STOP button ───────────────────────────────────────────────
-            bx1, by1, bx2, by2 = scaled_w - 120, 14, scaled_w - 10, 56
-            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 0, 160), -1)
-            cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
-            cv2.putText(display_frame, 'STOP', (bx1 + 18, by2 - 12),
+            _bx1 = scaled_w - 120
+            _by1 = 14
+            _bx2 = scaled_w - 10
+            _by2 = 56
+            btn_coords[0], btn_coords[1] = _bx1, _by1
+            btn_coords[2], btn_coords[3] = _bx2, _by2
+            cv2.rectangle(display_frame, (_bx1, _by1), (_bx2, _by2), (0, 0, 160), -1)
+            cv2.rectangle(display_frame, (_bx1, _by1), (_bx2, _by2), (255, 255, 255), 1)
+            cv2.putText(display_frame, 'STOP', (_bx1 + 18, _by2 - 12),
                         font, 0.8, (255, 255, 255), 2)
-
-            cv2.setMouseCallback(win_name, mouse_callback, (h_f, w_f))
             cv2.imshow(win_name, display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q') or stop_flag[0]:
@@ -906,16 +912,13 @@ def use_webcam():
     show_video(0)
 
 def do_exit():
-    """Safe exit: ensures all threads and windows close immediately."""
+    """Safe exit: works whether or not the cv2 loop is running."""
+    # Signal the video loop to stop if it is running
+    # (stop_flag is local to show_video, so we destroy root which deiconify triggers cleanup)
     try:
-        # Signal executor to stop if possible
-        if 'executor' in locals():
-            executor.shutdown(wait=False)
-        root.quit()
         root.destroy()
-        sys.exit(0)
     except Exception:
-        os._exit(0) # Forced exit if tkinter is stuck
+        pass
 
 btn_frame = tk.Frame(root, bg="#0d1117")
 btn_frame.pack(pady=30)
