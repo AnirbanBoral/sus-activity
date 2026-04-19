@@ -102,7 +102,7 @@ except Exception as e:
     has_lstm = False
 
 print("[INFO] Initializing YOLO Tracker...")
-yolo_model = YOLO("yolov8s.pt") if YOLO else None
+yolo_model = YOLO("yolov10n.pt") if YOLO else None
 
 # Initialize MediaPipe PoseLandmarker
 pose_landmarker = None
