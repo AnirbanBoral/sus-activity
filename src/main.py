@@ -87,7 +87,8 @@ DETECTION_TOGGLES = {
 # =============================================================================
 # Shared AI Intelligence Hub (Loaded Once)
 print("[INFO] Initializing Shared AI Models...")
-_ai_lock = threading.Lock()
+_yolo_lock = threading.Lock()   # guards yolo_model.track() — YOLO and MediaPipe are separate, no shared state
+_pose_lock = threading.Lock()   # guards pose_landmarker.detect()
 
 try:
     lstm_model = load_model(MODEL_PATH)
@@ -234,25 +235,37 @@ class CameraStream:
         if self.cap: self.cap.release()
 
     def _run_loop(self):
-        frame_cnt = 0
+        frame_cnt   = 0
+        fail_streak = 0
+        MAX_FAILS   = 10  # tolerate up to 10 consecutive bad reads before giving up
+
         while self.running:
             ret, frame = self.cap.read()
-            if not ret: break
-            frame_cnt += 1
-            if frame_cnt % 2 != 0: continue
+            if not ret:
+                fail_streak += 1
+                if fail_streak >= MAX_FAILS:
+                    break
+                time.sleep(0.05)
+                continue
+            fail_streak = 0
+            frame_cnt  += 1
+            if frame_cnt % 2 != 0:
+                continue
             processed = self._process_frame(frame, frame_cnt)
             img = Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
             w, h = self.ui_label.winfo_width(), self.ui_label.winfo_height()
-            if w > 10 and h > 10: img = img.resize((w, h), Image.Resampling.LANCZOS)
+            if w > 10 and h > 10:
+                img = img.resize((w, h), Image.Resampling.LANCZOS)
             tk_img = ImageTk.PhotoImage(image=img)
             self.ui_label.after(0, lambda m=tk_img: self.ui_label.configure(image=m))
             self.ui_label.image = tk_img
+
         self.cap.release()
 
     def _process_frame(self, frame, frame_cnt):
         now = time.time(); ann = frame.copy(); h_f, w_f = frame.shape[:2]
         if self.heatmap_acc is None: self.heatmap_acc = np.zeros((h_f, w_f), dtype=np.float32)
-        with _ai_lock: res = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
+        with _yolo_lock: res = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
         weapon_boxes = []; person_boxes = []; person_ids = []
         if res and res[0].boxes is not None:
             for b, c in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.cls.int().cpu().tolist()):
@@ -268,18 +281,26 @@ class CameraStream:
                     v_flag = self._check_velocity(tid, cx, cy, now); f_flag = self._check_fall(tid, x1, y1, x2, y2, now)
                     w_flag = any(b[0]< (x1+x2)/2 <b[2] and b[1]< (y1+y2)/2 <b[3] for b in weapon_boxes)
                     active = []
-                    if w_flag and _toggle_vars["WEAPON"].get(): active.append("WEAPON")
+                    if w_flag   and _toggle_vars["WEAPON"].get():     active.append("WEAPON")
                     if raw_flag and _toggle_vars["POSE RULES"].get(): active.append(raw_flag)
-                    if f_flag and _toggle_vars["FALL"].get(): active.append("FALL")
+                    if f_flag   and _toggle_vars["FALL"].get():       active.append("FALL")
+                    if v_flag   and _toggle_vars["RAPID MOVE"].get(): active.append("RAPID MOVE")
                     self.track_active_flags[tid] = active
                     if active and not self.alert_sent:
                         self.alert_sent = True; lbl = " | ".join(active); log_event(lbl, 0.90, self.camera_id)
                         snap = save_snapshot(ann, lbl, self.camera_id); notifier.send_alert(lbl, 0.90, snap); self.flash_frames = 30
-                        cv2.circle(self.heatmap_acc, (int((x1+x2)/2), int((y1+y2)/2)), 60, 1.0, -1)
-        if self.heatmap_on and self.heatmap_acc.max() > 0:
+                        _sf = min(w_f / 1280.0, h_f / 720.0)
+                        _r  = max(10, int(60 * _sf))
+                        cv2.circle(self.heatmap_acc, (int((x1+x2)/2), int((y1+y2)/2)), _r, 1.0, -1)
+        if self.heatmap_on and self.heatmap_acc is not None and self.heatmap_acc.max() > 0:
+            # Scale blur kernel to actual frame size (calibrated for 1280x720)
+            _sf = min(w_f / 1280.0, h_f / 720.0)
+            _k  = max(3, int(21 * _sf) | 1)  # must be odd, minimum 3
             norm = cv2.normalize(self.heatmap_acc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            blur = cv2.GaussianBlur(norm, (51, 51), 0); cmap = cv2.applyColorMap(blur, cv2.COLORMAP_JET)
-            mask = blur > 10; ann[mask] = cv2.addWeighted(ann, 0.6, cmap, 0.4, 0)[mask]
+            blur = cv2.GaussianBlur(norm, (_k, _k), 0)
+            cmap = cv2.applyColorMap(blur, cv2.COLORMAP_JET)
+            mask = blur > 10
+            ann[mask] = cv2.addWeighted(ann, 0.6, cmap, 0.4, 0)[mask]
         cv2.putText(ann, f"{self.camera_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         if self.flash_frames > 0:
             self.flash_frames -= 1
@@ -288,7 +309,7 @@ class CameraStream:
 
     def _run_pose_analysis(self, crop, tid, box, f_shape):
         if pose_landmarker is None: return None, np.zeros(POSE_VECTOR_SIZE), None
-        with _ai_lock: res = pose_landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+        with _pose_lock: res = pose_landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
         if not res.pose_landmarks: return None, np.zeros(POSE_VECTOR_SIZE), None
         lm = res.pose_landmarks[0]; l_w, r_w, l_s, r_s = lm[15], lm[16], lm[11], lm[12]
         s_y = (l_s.y + r_s.y) / 2
@@ -296,13 +317,29 @@ class CameraStream:
         return flag, np.zeros(POSE_VECTOR_SIZE), lm
 
     def _check_velocity(self, tid, cx, cy, now):
-        if tid not in self.track_center_history: self.track_center_history[tid] = deque(maxlen=10)
-        self.track_center_history[tid].append((cx, cy, now)); return None
+        if tid not in self.track_center_history:
+            self.track_center_history[tid] = deque(maxlen=10)
+        self.track_center_history[tid].append((cx, cy, now))
+        hist = self.track_center_history[tid]
+        if len(hist) < 4:
+            return None
+        dt   = max(hist[-1][2] - hist[0][2], 0.001)
+        dist = ((hist[-1][0] - hist[0][0])**2 + (hist[-1][1] - hist[0][1])**2) ** 0.5
+        return "RAPID MOVE" if dist / dt > VELOCITY_THRESH else None
 
     def _check_fall(self, tid, x1, y1, x2, y2, now):
-        h = y2-y1
-        if tid not in self.track_bbox_history: self.track_bbox_history[tid] = deque(maxlen=20)
-        self.track_bbox_history[tid].append((h, now)); return None
+        h = y2 - y1
+        if tid not in self.track_bbox_history:
+            self.track_bbox_history[tid] = deque(maxlen=20)
+        self.track_bbox_history[tid].append((h, now))
+        hist = self.track_bbox_history[tid]
+        if len(hist) < 10:
+            return None
+        prev_h = sum(v[0] for v in list(hist)[:5])  / 5
+        curr_h = sum(v[0] for v in list(hist)[-5:]) / 5
+        if prev_h > 0 and (prev_h - curr_h) / prev_h > FALL_THRESH:
+            return "FALL DETECTED"
+        return None
 
 # =============================================================================
 # Main UI Logic
@@ -321,18 +358,58 @@ class MultiStreamApp:
         self.grid = tk.Frame(self.root, bg="#0d1117"); self.grid.pack(fill="both", expand=True, padx=10, pady=10)
 
     def _add_camera(self):
-        src = simpledialog.askstring("Add Stream", "Enter RTSP URL or ID (0, 1):", parent=self.root)
-        if src:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add Stream"); dlg.configure(bg="#0d1117")
+        dlg.geometry("420x185"); dlg.resizable(False, False)
+        dlg.attributes("-topmost", True); dlg.grab_set()
+
+        tk.Label(dlg, text="Enter RTSP URL, device ID (0, 1), or pick a video file:",
+                 bg="#0d1117", fg="#c9d1d9", font=("Helvetica", 10),
+                 wraplength=380, justify="left").pack(padx=16, pady=(14, 6), anchor="w")
+
+        entry_var = tk.StringVar()
+        row = tk.Frame(dlg, bg="#0d1117"); row.pack(fill="x", padx=16)
+        entry = tk.Entry(row, textvariable=entry_var, bg="#161b22", fg="white",
+                         insertbackground="white", relief="flat", font=("Helvetica", 11))
+        entry.pack(side="left", fill="x", expand=True, ipady=5)
+
+        def _browse():
+            path = askopenfilename(
+                parent=dlg, title="Select video file",
+                filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov"), ("All files", "*.*")])
+            if path: entry_var.set(path)
+
+        tk.Button(row, text="Browse…", command=_browse,
+                  bg="#30363d", fg="white", relief="flat", padx=8).pack(side="left", padx=(6, 0))
+
+        def _confirm():
+            src = entry_var.get().strip()
+            if not src: dlg.destroy(); return
             if src.isdigit(): src = int(src)
-            cid = f"CAM-{len(self.streams)+1}"; p = tk.Frame(self.grid, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
+            dlg.destroy()
+            cid = f"CAM-{len(self.streams) + 1}"
+            p = tk.Frame(self.grid, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
             l = tk.Label(p, bg="black"); l.pack(fill="both", expand=True)
             n = len(self.streams) + 1; cols = 2 if n > 1 else 1; rows = (n + 1) // 2
             p.grid(row=(n-1)//cols, column=(n-1)%cols, sticky="nsew", padx=5, pady=5)
             for i in range(rows): self.grid.grid_rowconfigure(i, weight=1)
             for i in range(cols): self.grid.grid_columnconfigure(i, weight=1)
             s = CameraStream(src, cid, l)
-            if s.start(): self.streams.append(s)
-            else: p.destroy()
+            if s.start():
+                self.streams.append(s)
+            else:
+                p.destroy()
+                messagebox.showerror("Stream Error",
+                                     f"Could not open:\n{src}\n\nCheck the URL or file path.",
+                                     parent=self.root)
+
+        btn_row = tk.Frame(dlg, bg="#0d1117"); btn_row.pack(pady=12)
+        tk.Button(btn_row, text="Connect", command=_confirm, bg="#238636", fg="white",
+                  relief="flat", font=("Helvetica", 11, "bold"), padx=16).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", command=dlg.destroy,
+                  bg="#21262d", fg="#8b949e", relief="flat", padx=16).pack(side="left")
+        dlg.bind("<Return>", lambda e: _confirm())
+        entry.focus_set()
 
 # Module-level placeholders — populated after tk.Tk() is created in __main__
 root = None
