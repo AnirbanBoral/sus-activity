@@ -70,7 +70,10 @@ VELOCITY_THRESH    = 0.18
 PROXIMITY_THRESH   = 0.12
 LOITER_SECONDS     = 10
 LOITER_MOVE_THRESH = 0.04
-WEAPON_CLASSES     = [43, 76, 73, 74]
+# COCO class IDs: 43=knife, 34=baseball bat, 76=scissors
+# Removed 73 (book) and 74 (clock) which were wrong COCO IDs
+WEAPON_CLASSES     = [43, 34, 76]
+WEAPON_PADDING     = 80   # px — weapon box expanded before person overlap test
 FALL_THRESH        = 0.45
 FLAIL_THRESH       = 0.08
 FLAIL_MIN_FRAMES   = 5
@@ -270,7 +273,12 @@ class CameraStream:
         if res and res[0].boxes is not None:
             for b, c in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.cls.int().cpu().tolist()):
                 if c == 0: person_boxes.append(b)
-                elif c in WEAPON_CLASSES: weapon_boxes.append(b); cv2.rectangle(ann, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 0, 255), 2)
+                elif c in WEAPON_CLASSES:
+                    weapon_boxes.append(b)
+                    wx1, wy1, wx2, wy2 = map(int, b)
+                    cv2.rectangle(ann, (wx1, wy1), (wx2, wy2), (0, 0, 255), 3)
+                    cv2.putText(ann, "WEAPON", (wx1, wy1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             if res[0].boxes.id is not None:
                 person_ids = [tid for tid, cls in zip(res[0].boxes.id.int().cpu().tolist(), res[0].boxes.cls.int().cpu().tolist()) if cls == 0]
                 for box, tid in zip(person_boxes, person_ids):
@@ -279,7 +287,15 @@ class CameraStream:
                     raw_flag, pose_vec, lms = self._run_pose_analysis(crop, tid, (x1,y1,x2,y2), frame.shape)
                     cx, cy = (x1+x2)/2/w_f, (y1+y2)/2/h_f
                     v_flag = self._check_velocity(tid, cx, cy, now); f_flag = self._check_fall(tid, x1, y1, x2, y2, now)
-                    w_flag = any(b[0]< (x1+x2)/2 <b[2] and b[1]< (y1+y2)/2 <b[3] for b in weapon_boxes)
+                    # Weapon proximity: weapon box (with padding) overlaps person box
+                    # Previous check tested person-center inside weapon-box — inverted and too strict
+                    w_flag = any(
+                        (int(wb[0]) - WEAPON_PADDING) < x2 and
+                        (int(wb[2]) + WEAPON_PADDING) > x1 and
+                        (int(wb[1]) - WEAPON_PADDING) < y2 and
+                        (int(wb[3]) + WEAPON_PADDING) > y1
+                        for wb in weapon_boxes
+                    )
                     active = []
                     if w_flag   and _toggle_vars["WEAPON"].get():     active.append("WEAPON")
                     if raw_flag and _toggle_vars["POSE RULES"].get(): active.append(raw_flag)
@@ -309,12 +325,46 @@ class CameraStream:
 
     def _run_pose_analysis(self, crop, tid, box, f_shape):
         if pose_landmarker is None: return None, np.zeros(POSE_VECTOR_SIZE), None
-        with _pose_lock: res = pose_landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+        if crop.shape[0] < 48 or crop.shape[1] < 48: return None, np.zeros(POSE_VECTOR_SIZE), None
+        try:
+            with _pose_lock:
+                res = pose_landmarker.detect(
+                    mp.Image(image_format=mp.ImageFormat.SRGB,
+                             data=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+        except Exception:
+            return None, np.zeros(POSE_VECTOR_SIZE), None
         if not res.pose_landmarks: return None, np.zeros(POSE_VECTOR_SIZE), None
-        lm = res.pose_landmarks[0]; l_w, r_w, l_s, r_s = lm[15], lm[16], lm[11], lm[12]
+        lm = res.pose_landmarks[0]
+        if len(lm) <= max(IDX_L_KNEE, IDX_R_KNEE): return None, np.zeros(POSE_VECTOR_SIZE), None
+        l_w, r_w = lm[IDX_L_WRIST], lm[IDX_R_WRIST]
+        l_s, r_s = lm[IDX_L_SHOULDER], lm[IDX_R_SHOULDER]
+        l_h, r_h = lm[IDX_L_HIP], lm[IDX_R_HIP]
+        l_k, r_k = lm[IDX_L_KNEE], lm[IDX_R_KNEE]
+        nose     = lm[IDX_NOSE]
         s_y = (l_s.y + r_s.y) / 2
-        flag = "RAISED ARMS" if l_w.y < s_y-0.2 and r_w.y < s_y-0.2 else None
-        return flag, np.zeros(POSE_VECTOR_SIZE), lm
+        h_y = (l_h.y + r_h.y) / 2
+        h_x = (l_h.x + r_h.x) / 2
+        # RAISED ARMS removed — too many false positives (e.g. reaching for shelf)
+        # Rules kept: striking posture, aggressive lean, lunge
+        flag = None
+        if l_k.y < h_y - STRIKE_THRESH or r_k.y < h_y - STRIKE_THRESH:
+            flag = "STRIKING POSTURE"
+        elif abs(nose.x - h_x) > LEAN_THRESH:
+            flag = "AGGRESSIVE LEAN"
+        elif tid in self.track_pose_prev:
+            if abs(h_x - self.track_pose_prev[tid]) > LUNGE_THRESH:
+                flag = "LUNGE DETECTED"
+        self.track_pose_prev[tid] = h_x
+        # Build global-coordinate pose vector
+        bx1, by1, bx2, by2 = box; fh, fw = f_shape[:2]
+        vec = []
+        for landmark in lm:
+            gx = landmark.x * (bx2-bx1) / max(fw,1) + bx1 / max(fw,1)
+            gy = landmark.y * (by2-by1) / max(fh,1) + by1 / max(fh,1)
+            vec.extend([gx, gy, landmark.z])
+        pose_vec = np.array(vec, dtype='float32')
+        self.track_last_valid_pose[tid] = pose_vec
+        return flag, pose_vec, lm
 
     def _check_velocity(self, tid, cx, cy, now):
         if tid not in self.track_center_history:
