@@ -436,6 +436,18 @@ class MultiStreamApp:
             src = entry_var.get().strip()
             if not src: dlg.destroy(); return
             if src.isdigit(): src = int(src)
+            # Block a second webcam — only one integer (device) source allowed at a time
+            if isinstance(src, int):
+                already = [s for s in self.streams if isinstance(s.source, int)]
+                if already:
+                    dlg.destroy()
+                    messagebox.showwarning(
+                        "Webcam Already Active",
+                        f"Webcam (device {already[0].source}) is already running.\n"
+                        "Only one webcam is allowed at a time.\n\n"
+                        "Add an RTSP stream or video file instead.",
+                        parent=self.root)
+                    return
             dlg.destroy()
             cid = f"CAM-{len(self.streams) + 1}"
             p = tk.Frame(self.grid, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
