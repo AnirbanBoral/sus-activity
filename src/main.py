@@ -334,22 +334,48 @@ class MultiStreamApp:
             if s.start(): self.streams.append(s)
             else: p.destroy()
 
+# Module-level placeholders — populated after tk.Tk() is created in __main__
+root = None
+_toggle_vars: dict = {k: None for k in DETECTION_TOGGLES}  # filled in __main__
+
 def open_settings():
-    win = tk.Toplevel(root); win.title("Settings"); win.configure(bg="#0d1117"); win.geometry("440x600")
+    win = tk.Toplevel(root); win.title("Settings"); win.configure(bg="#0d1117"); win.geometry("440x620")
+    win.resizable(False, False); win.attributes("-topmost", True)
     tk.Label(win, text="Detection Toggles", font=("Helvetica", 13, "bold"), bg="#0d1117", fg="white").pack(pady=10)
-    for k, v in _toggle_vars.items():
-        tk.Checkbutton(win, text=k, variable=v, bg="#0d1117", fg="white", selectcolor="#1f6feb", command=lambda: save_settings(_toggle_vars)).pack(anchor="w", padx=20)
-    tk.Label(win, text="Email Config", font=("Helvetica", 13, "bold"), bg="#0d1117", fg="white").pack(pady=10)
-    cfg = notifier.load_config()
-    for lbl, k in [("Sender", "sender_email"), ("Pass", "sender_password"), ("Recipient", "recipient_email")]:
-        tk.Label(win, text=lbl, bg="#0d1117", fg="#8b949e").pack(anchor="w", padx=20)
-        e = tk.Entry(win, bg="#161b22", fg="white"); e.insert(0, cfg.get(k, "")); e.pack(fill="x", padx=20, pady=2)
+    tk.Label(win, text="Applies to all active camera streams", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
+    LABELS = {
+        "WEAPON": "Weapon detection", "INTENT": "LSTM suspicious intent",
+        "POSE RULES": "Pose rules (raised arms, lunge…)", "FALL": "Fall detection",
+        "PERSON DOWN": "Person down (prone)", "RAPID MOVE": "Rapid movement",
+        "FLAILING": "Arm flailing", "LOITERING": "Loitering", "PROXIMITY": "Proximity / conflict",
+    }
+    for k, lbl in LABELS.items():
+        var = _toggle_vars.get(k)
+        if var is not None:
+            tk.Checkbutton(win, text=lbl, variable=var, bg="#0d1117", fg="white",
+                           selectcolor="#1f6feb", activebackground="#0d1117", activeforeground="white",
+                           font=("Helvetica", 11), anchor="w",
+                           command=lambda: save_settings(_toggle_vars)).pack(fill="x", padx=20, pady=2)
+    tk.Label(win, text="Email Alert Config", font=("Helvetica", 13, "bold"), bg="#0d1117", fg="white").pack(pady=(14, 2))
+    tk.Label(win, text="Use a Gmail App Password", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
+    cfg = notifier.load_config(); entries = {}
+    for lbl, k, show in [("Sender Gmail", "sender_email", ""), ("App Password", "sender_password", "*"), ("Recipient", "recipient_email", "")]:
+        tk.Label(win, text=lbl, bg="#0d1117", fg="#c9d1d9", anchor="w").pack(fill="x", padx=20)
+        e = tk.Entry(win, bg="#161b22", fg="white", insertbackground="white", relief="flat", show=show)
+        e.insert(0, cfg.get(k, "")); e.pack(fill="x", padx=20, pady=2, ipady=4); entries[k] = e
+    def _save_email():
+        nc = notifier.load_config()
+        for fk, ew in entries.items(): nc[fk] = ew.get().strip()
+        notifier.save_config(nc); messagebox.showinfo("Saved", "Email settings saved.", parent=win)
+    tk.Button(win, text="Save Email Settings", command=_save_email, bg="#238636", fg="white",
+              relief="flat", font=("Helvetica", 11, "bold")).pack(pady=10)
+    tk.Button(win, text="Close", command=win.destroy, bg="#21262d", fg="#8b949e", relief="flat").pack()
 
 def open_dashboard(): LiveDashboard(root)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    # BooleanVar requires an existing Tk root — must be created AFTER tk.Tk()
+    # BooleanVar MUST be created after tk.Tk() root window exists
     saved = load_settings()
     _toggle_vars = {k: tk.BooleanVar(value=saved.get(k, v)) for k, v in DETECTION_TOGGLES.items()}
     app = MultiStreamApp(root)
