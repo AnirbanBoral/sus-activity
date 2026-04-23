@@ -347,7 +347,10 @@ def open_settings():
 
 def open_dashboard(): LiveDashboard(root)
 
-_toggle_vars = {k: tk.BooleanVar(value=v) for k, v in load_settings().items() or DETECTION_TOGGLES.items()}
-
 if __name__ == "__main__":
-    root = tk.Tk(); app = MultiStreamApp(root); root.mainloop()
+    root = tk.Tk()
+    # BooleanVar requires an existing Tk root — must be created AFTER tk.Tk()
+    saved = load_settings()
+    _toggle_vars = {k: tk.BooleanVar(value=saved.get(k, v)) for k, v in DETECTION_TOGGLES.items()}
+    app = MultiStreamApp(root)
+    root.mainloop()
