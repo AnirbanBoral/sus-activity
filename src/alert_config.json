@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 465,
+  "use_ssl": true,
+  "recipient_email": "",
+  "min_interval_s": 30
+}

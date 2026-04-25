@@ -1,0 +1,11 @@
+{
+  "WEAPON": true,
+  "INTENT": true,
+  "POSE RULES": true,
+  "FALL": true,
+  "PERSON DOWN": true,
+  "RAPID MOVE": true,
+  "FLAILING": true,
+  "LOITERING": true,
+  "PROXIMITY": true
+}

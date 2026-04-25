@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 title Hybrid AI Surveillance - Auto-Setup & Launch
 echo ===================================================
-echo   Hybrid AI Surveillance System - Professional
+echo   Hybrid AI Surveillance System
 echo ===================================================
 
 :: 1. Check for Python installation

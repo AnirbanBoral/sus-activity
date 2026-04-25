@@ -52,11 +52,11 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 IMAGE_HEIGHT, IMAGE_WIDTH = 128, 128
 SEQUENCE_LENGTH           = 12
 POSE_VECTOR_SIZE          = 99
-LSTM_CONFIDENCE_THRESHOLD = 0.70
+LSTM_CONFIDENCE_THRESHOLD = 0.65
 
 RAISED_ARM_THRESH = 0.22
 LUNGE_THRESH      = 0.28
-STRIKE_THRESH     = 0.10
+STRIKE_THRESH     = 0.15   # lowered from 0.20 — restores pose rule sensitivity
 LEAN_THRESH       = 0.30
 RULE_CONFIRM_N    = 3
 
@@ -66,7 +66,7 @@ IDX_L_WRIST    = 15; IDX_R_WRIST    = 16
 IDX_L_HIP      = 23; IDX_R_HIP      = 24
 IDX_L_KNEE     = 25; IDX_R_KNEE     = 26
 
-VELOCITY_THRESH    = 0.18
+VELOCITY_THRESH    = 0.35
 PROXIMITY_THRESH   = 0.12
 LOITER_SECONDS     = 10
 LOITER_MOVE_THRESH = 0.04
@@ -102,7 +102,9 @@ except Exception as e:
     lstm_model = None
     has_lstm   = False
 
-yolo_model = YOLO("yolov10n.pt") if YOLO else None
+# Global yolo_model removed — each CameraStream creates its own YOLO instance
+# so ByteTracker state stays isolated per stream (shared instance corrupts tracking).
+yolo_model = None  # kept for legacy import references only
 pose_landmarker = None
 if HAS_MEDIAPIPE and os.path.exists(POSE_MODEL):
     try:
@@ -193,7 +195,10 @@ class LiveDashboard:
             self._total_var.set(str(len(events)))
             e = int(time.time() - self._start); m, s = divmod(e, 60); self._session_var.set(f"{m:02d}:{s:02d}")
             counts = defaultdict(int)
-            for ev in events: counts[ev["type"].split("]")[1].strip()[:16]] += 1
+            for ev in events:
+                raw = ev["type"]
+                key = raw.split("]")[1].strip()[:16] if "]" in raw else raw[:16]
+                counts[key] += 1
             self._canvas.delete("all")
             if counts:
                 items = sorted(counts.items(), key=lambda x: -x[1])[:6]; max_v = max(v for _, v in items)
@@ -215,77 +220,165 @@ class LiveDashboard:
 # =============================================================================
 # Camera Stream Class
 class CameraStream:
-    def __init__(self, source, camera_id, ui_label):
-        self.source = source; self.camera_id = camera_id; self.ui_label = ui_label
+    def __init__(self, source, camera_id, ui_label, status_label=None):
+        self.source       = source
+        self.camera_id    = camera_id
+        self.ui_label     = ui_label
+        self.status_label = status_label  # small bar above feed tile
+        # Per-stream YOLO — isolates ByteTracker state so multi-cam tracking is correct
+        self.yolo = YOLO("yolov10n.pt") if YOLO else None
         self.cap = None; self.running = False; self.thread = None
-        self.track_buffers = {}; self.track_pose_buffers = {}; self.track_status = {}
+        self.track_buffers = {}; self.track_pose_buffers = {}; self.track_status = {}; self.track_scores = {}
         self.track_active_flags = {}; self.track_last_valid_pose = {}; self.track_pose_prev = {}
         self.track_center_history = {}; self.track_bbox_history = {}; self.track_wrist_history = {}
         self.track_last_lm = {}; self.prone_history = {}; self.flag_first_seen = {}
-        self.alert_sent = False; self.normal_frames = 0; self.flash_frames = 0
-        self.heatmap_acc = None; self.heatmap_on = True; self.executor = ThreadPoolExecutor(max_workers=2)
+        self.track_last_alert_time = {}
+        self.ALERT_COOLDOWN_S = 30
+        self.flash_frames  = 0
+        self.current_status = "NORMAL"  # "NORMAL" | "SUSPICIOUS" | "CRITICAL"
+        self.heatmap_acc = None; self.heatmap_on = True
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self.processing_tracks = set()
+
+        # Lag Solutions state variables
+        self.is_live = False
+        self.capture_thread = None
+        self.latest_frame = None
+        self.latest_frame_id = 0
+        self.track_last_pose_flag = {}
 
     def start(self):
         self.cap = cv2.VideoCapture(self.source)
         if not self.cap.isOpened(): return False
-        self.running = True; self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.running = True
+        
+        # Lag Solution 1: Decoupled reader for live feeds to prevent OS buffer lag
+        self.is_live = isinstance(self.source, int) or str(self.source).startswith(("rtsp", "http"))
+        if self.is_live:
+            self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.capture_thread.start()
+            
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start(); return True
 
     def stop(self):
         self.running = False
         if self.thread: self.thread.join(timeout=1.0)
+        if self.capture_thread: self.capture_thread.join(timeout=1.0)
         if self.cap: self.cap.release()
+
+    def _capture_loop(self):
+        """Always read the freshest frame into memory."""
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                self.latest_frame = frame
+                self.latest_frame_id += 1
+            else:
+                time.sleep(0.01)
 
     def _run_loop(self):
         frame_cnt   = 0
         fail_streak = 0
         MAX_FAILS   = 10  # tolerate up to 10 consecutive bad reads before giving up
+        last_processed_id = -1
+        
+        # Determine source FPS for throttling offline videos
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0 or np.isnan(fps): fps = 25.0
+        frame_time = 1.0 / fps
 
         while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                fail_streak += 1
-                if fail_streak >= MAX_FAILS:
-                    break
-                time.sleep(0.05)
-                continue
-            fail_streak = 0
-            frame_cnt  += 1
-            if frame_cnt % 2 != 0:
-                continue
+            start_t = time.time()
+            if self.is_live:
+                if self.latest_frame is None or self.latest_frame_id == last_processed_id:
+                    time.sleep(0.01)
+                    continue
+                frame = self.latest_frame.copy()
+                last_processed_id = self.latest_frame_id
+                frame_cnt += 1
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    fail_streak += 1
+                    if fail_streak >= MAX_FAILS:
+                        break
+                    time.sleep(0.05)
+                    continue
+                fail_streak = 0
+                frame_cnt  += 1
+
             processed = self._process_frame(frame, frame_cnt)
-            img = Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
-            w, h = self.ui_label.winfo_width(), self.ui_label.winfo_height()
-            if w > 10 and h > 10:
-                img = img.resize((w, h), Image.Resampling.LANCZOS)
+            tw = self.ui_label.winfo_width()
+            th = self.ui_label.winfo_height()
+            if tw > 10 and th > 10:
+                # cv2 resize is ~3x faster than PIL LANCZOS in a tight thread loop
+                display = cv2.resize(processed, (tw, th), interpolation=cv2.INTER_LINEAR)
+            else:
+                display = processed
+            img    = Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
             tk_img = ImageTk.PhotoImage(image=img)
             self.ui_label.after(0, lambda m=tk_img: self.ui_label.configure(image=m))
             self.ui_label.image = tk_img
+            
+            # Throttle offline video playback to match natural FPS
+            # This prevents the async LSTM queue from backing up and skipping the event
+            if not self.is_live:
+                elapsed = time.time() - start_t
+                if elapsed < frame_time:
+                    time.sleep(frame_time - elapsed)
 
         self.cap.release()
 
     def _process_frame(self, frame, frame_cnt):
         now = time.time(); ann = frame.copy(); h_f, w_f = frame.shape[:2]
         if self.heatmap_acc is None: self.heatmap_acc = np.zeros((h_f, w_f), dtype=np.float32)
-        with _yolo_lock: res = yolo_model.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
+        if self.yolo is None:
+            return ann
+        try:
+            res = self.yolo.track(frame, persist=True, classes=[0]+WEAPON_CLASSES, verbose=False)
+        except Exception as e:
+            print(f"[YOLO ERROR {self.camera_id}]: {e}")
+            return ann
         weapon_boxes = []; person_boxes = []; person_ids = []
         if res and res[0].boxes is not None:
-            for b, c in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.cls.int().cpu().tolist()):
-                if c == 0: person_boxes.append(b)
+            boxes    = res[0].boxes
+            xyxy_all = boxes.xyxy.cpu().numpy()
+            cls_all  = boxes.cls.int().cpu().tolist()
+            id_all   = boxes.id.int().cpu().tolist() if boxes.id is not None else [None]*len(cls_all)
+            for b, c, tid in zip(xyxy_all, cls_all, id_all):
+                if c == 0:
+                    person_boxes.append(b)
+                    person_ids.append(tid)
                 elif c in WEAPON_CLASSES:
                     weapon_boxes.append(b)
                     wx1, wy1, wx2, wy2 = map(int, b)
                     cv2.rectangle(ann, (wx1, wy1), (wx2, wy2), (0, 0, 255), 3)
                     cv2.putText(ann, "WEAPON", (wx1, wy1 - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            if res[0].boxes.id is not None:
-                person_ids = [tid for tid, cls in zip(res[0].boxes.id.int().cpu().tolist(), res[0].boxes.cls.int().cpu().tolist()) if cls == 0]
-                for box, tid in zip(person_boxes, person_ids):
+            valid_pairs = [(box, tid) for box, tid in zip(person_boxes, person_ids) if tid is not None]
+            for box, tid in valid_pairs:
                     x1, y1, x2, y2 = map(int, box); crop = frame[max(0, y1):min(h_f, y2), max(0, x1):min(w_f, x2)]
                     if crop.size == 0: continue
-                    raw_flag, pose_vec, lms = self._run_pose_analysis(crop, tid, (x1,y1,x2,y2), frame.shape)
                     cx, cy = (x1+x2)/2/w_f, (y1+y2)/2/h_f
+                    
+                    # Lag Solution 3: Pose Analysis Throttling
+                    moved_enough = True
+                    if tid in self.track_center_history:
+                        hist = self.track_center_history[tid]
+                        if len(hist) > 0:
+                            last_cx, last_cy, _ = hist[-1]
+                            dist_px = ((cx - last_cx)*w_f)**2 + ((cy - last_cy)*h_f)**2
+                            if dist_px < 25.0:  # Less than 5 pixels movement
+                                moved_enough = False
+
+                    if moved_enough or tid not in self.track_last_valid_pose:
+                        raw_flag, pose_vec, lms = self._run_pose_analysis(crop, tid, (x1,y1,x2,y2), frame.shape)
+                        self.track_last_pose_flag[tid] = raw_flag
+                    else:
+                        pose_vec = self.track_last_valid_pose[tid]
+                        raw_flag = self.track_last_pose_flag.get(tid, None)
+                        
                     v_flag = self._check_velocity(tid, cx, cy, now); f_flag = self._check_fall(tid, x1, y1, x2, y2, now)
                     # Weapon proximity: weapon box (with padding) overlaps person box
                     # Previous check tested person-center inside weapon-box — inverted and too strict
@@ -296,18 +389,88 @@ class CameraStream:
                         (int(wb[3]) + WEAPON_PADDING) > y1
                         for wb in weapon_boxes
                     )
+                    # LSTM Intent Analysis
+                    lstm_verdict = "Tracking..."
+                    if has_lstm:
+                        try:
+                            arr = preprocess_input(np.array(cv2.cvtColor(
+                                cv2.resize(crop, (IMAGE_WIDTH, IMAGE_HEIGHT)),
+                                cv2.COLOR_BGR2RGB), dtype='float32'))
+                            if tid not in self.track_buffers:
+                                self.track_buffers[tid] = deque(maxlen=SEQUENCE_LENGTH)
+                                self.track_pose_buffers[tid] = deque(maxlen=SEQUENCE_LENGTH)
+                                self.track_status[tid] = "Tracking..."
+                            self.track_buffers[tid].append(arr)
+                            self.track_pose_buffers[tid].append(pose_vec)
+                            if (len(self.track_buffers[tid]) == SEQUENCE_LENGTH and
+                                    (frame_cnt + tid) % 3 == 0 and
+                                    tid not in self.processing_tracks):
+                                self.processing_tracks.add(tid)
+                                X_img = np.expand_dims(np.array(self.track_buffers[tid]), 0)
+                                X_pose = np.expand_dims(np.array(self.track_pose_buffers[tid]), 0)
+                                self.executor.submit(self._evaluate_intent_async, tid, X_img, X_pose)
+                        except Exception as e: print(f"[LSTM ERROR]: {e}")
+                        lstm_verdict = self.track_status.get(tid, "Tracking...")
+
+                    i_flag = lstm_verdict if "SUSPICIOUS" in lstm_verdict else None
+
                     active = []
                     if w_flag   and _toggle_vars["WEAPON"].get():     active.append("WEAPON")
                     if raw_flag and _toggle_vars["POSE RULES"].get(): active.append(raw_flag)
                     if f_flag   and _toggle_vars["FALL"].get():       active.append("FALL")
                     if v_flag   and _toggle_vars["RAPID MOVE"].get(): active.append("RAPID MOVE")
+                    if i_flag   and _toggle_vars["INTENT"].get():     active.append(i_flag)
                     self.track_active_flags[tid] = active
-                    if active and not self.alert_sent:
-                        self.alert_sent = True; lbl = " | ".join(active); log_event(lbl, 0.90, self.camera_id)
-                        snap = save_snapshot(ann, lbl, self.camera_id); notifier.send_alert(lbl, 0.90, snap); self.flash_frames = 30
-                        _sf = min(w_f / 1280.0, h_f / 720.0)
-                        _r  = max(10, int(60 * _sf))
-                        cv2.circle(self.heatmap_acc, (int((x1+x2)/2), int((y1+y2)/2)), _r, 1.0, -1)
+
+                    # ── Draw person bounding box + labels ──────────────────
+                    if active:
+                        box_col = (0, 0, 220)   if any(f in ("WEAPON","FALL DETECTED") for f in active) \
+                             else (0, 140, 255)  # red for critical, orange for suspicious
+                    else:
+                        box_col = (50, 200, 50)  # green = normal
+                    cv2.rectangle(ann, (x1, y1), (x2, y2), box_col, 2)
+
+                    # Track ID + LSTM verdict in one line above box
+                    verdict_short = lstm_verdict.replace("Tracking...", "...")[:20] if has_lstm else ""
+                    header = f"ID{tid}  {verdict_short}"
+                    (tw, th), _ = cv2.getTextSize(header, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(ann, (x1, y1 - th - 6), (x1 + tw + 4, y1), box_col, -1)
+                    cv2.putText(ann, header, (x1 + 2, y1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                    # Active flags stacked below box
+                    for fi, flag in enumerate(active):
+                        fy = y2 + 16 + fi * 16
+                        cv2.putText(ann, flag, (x1 + 2, fy),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
+
+                    # Per-track cooldown alert
+                    now_alert = time.time()
+                    last_alerted = self.track_last_alert_time.get(tid, 0)
+                    if active and (now_alert - last_alerted) > self.ALERT_COOLDOWN_S:
+                        self.track_last_alert_time[tid] = now_alert
+                        lbl = " | ".join(active)
+                        log_event(lbl, 0.90, self.camera_id)
+                        snap = save_snapshot(ann, lbl, self.camera_id)
+                        notifier.send_alert(lbl, 0.90, snap, self.camera_id)
+                        self.flash_frames = 30
+        # Prune stale track flags for IDs no longer detected in this frame
+        stale = [t for t in self.track_active_flags if t not in person_ids]
+        for t in stale:
+            del self.track_active_flags[t]
+
+        # Standalone Weapon Alert
+        if weapon_boxes and _toggle_vars["WEAPON"].get():
+            now_alert = time.time()
+            last_w_alert = self.track_last_alert_time.get("GLOBAL_WEAPON", 0)
+            if (now_alert - last_w_alert) > self.ALERT_COOLDOWN_S:
+                self.track_last_alert_time["GLOBAL_WEAPON"] = now_alert
+                lbl = "WEAPON DETECTED"
+                log_event(lbl, 0.99, self.camera_id)
+                snap = save_snapshot(ann, lbl, self.camera_id)
+                notifier.send_alert(lbl, 0.99, snap, self.camera_id)
+                self.flash_frames = 30
+
         if self.heatmap_on and self.heatmap_acc is not None and self.heatmap_acc.max() > 0:
             # Scale blur kernel to actual frame size (calibrated for 1280x720)
             _sf = min(w_f / 1280.0, h_f / 720.0)
@@ -317,10 +480,35 @@ class CameraStream:
             cmap = cv2.applyColorMap(blur, cv2.COLORMAP_JET)
             mask = blur > 10
             ann[mask] = cv2.addWeighted(ann, 0.6, cmap, 0.4, 0)[mask]
-        cv2.putText(ann, f"{self.camera_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Camera ID watermark — small, unobtrusive
+        cv2.putText(ann, self.camera_id, (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+        # Determine stream status for the status bar
+        all_flags = [f for flags in self.track_active_flags.values() for f in flags]
+        if weapon_boxes and _toggle_vars["WEAPON"].get():
+            all_flags.append("WEAPON DETECTED")
+            
+        if any("WEAPON" in f or "FALL" in f for f in all_flags):
+            self.current_status = "CRITICAL"
+        elif all_flags:
+            self.current_status = "SUSPICIOUS"
+        else:
+            self.current_status = "NORMAL"
+
+        # Push status to Tkinter status bar on the main thread
+        if self.status_label is not None:
+            _STATUS_MAP = {
+                "CRITICAL":   ("\u26a0  CRITICAL THREAT DETECTED",  "#7f1d1d", "#fca5a5"),
+                "SUSPICIOUS": ("\u25cf  SUSPICIOUS ACTIVITY",        "#1e3a5f", "#93c5fd"),
+                "NORMAL":     ("\u25cf  ALL CLEAR",                  "#14532d", "#86efac"),
+            }
+            st, sb, sf = _STATUS_MAP[self.current_status]
+            self.status_label.after(0, lambda t=st, b=sb, f=sf:
+                self.status_label.configure(text=t, bg=b, fg=f))
+
         if self.flash_frames > 0:
             self.flash_frames -= 1
-            if self.flash_frames % 4 < 2: cv2.rectangle(ann, (0, 0), (w_f, h_f), (0, 0, 255), 10)
         return ann
 
     def _run_pose_analysis(self, crop, tid, box, f_shape):
@@ -366,6 +554,17 @@ class CameraStream:
         self.track_last_valid_pose[tid] = pose_vec
         return flag, pose_vec, lm
 
+    def _evaluate_intent_async(self, t_id, X_seq, X_pose_seq):
+        try:
+            preds = lstm_model({"image_input": X_seq, "pose_input": X_pose_seq}, training=False).numpy()[0]
+            if t_id not in self.track_scores: self.track_scores[t_id] = deque(maxlen=3)
+            self.track_scores[t_id].append(preds)
+            avg = np.mean(self.track_scores[t_id], axis=0)
+            conf = float(np.max(avg))
+            self.track_status[t_id] = f"SUSPICIOUS ({avg[1]*100:.0f}%)" if np.argmax(avg) == 1 and conf > LSTM_CONFIDENCE_THRESHOLD else f"Normal ({avg[0]*100:.0f}%)"
+        except Exception as e: print(f"[LSTM ERROR]: {e}")
+        finally: self.processing_tracks.discard(t_id)
+
     def _check_velocity(self, tid, cx, cy, now):
         if tid not in self.track_center_history:
             self.track_center_history[tid] = deque(maxlen=10)
@@ -392,99 +591,126 @@ class CameraStream:
         return None
 
 # =============================================================================
-# Main UI Logic
-class MultiStreamApp:
+# Main UI — Single Camera
+class SurveillanceApp:
     def __init__(self, root):
-        self.root = root; self.root.title("Hybrid AI Command Center"); self.root.state('zoomed'); self.root.configure(bg="#0d1117")
-        self.streams = []; self._build_ui()
+        self.root   = root
+        self.stream = None          # currently active CameraStream (or None)
+        self.root.title("Hybrid AI Surveillance System")
+        self.root.state("zoomed")
+        self.root.configure(bg="#0d1117")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build_ui()
 
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        h = tk.Frame(self.root, bg="#161b22", height=60); h.pack(fill="x")
-        tk.Label(h, text="COMMAND CENTER", font=("Helvetica", 18, "bold"), bg="#161b22", fg="white").pack(side="left", padx=20)
-        c = tk.Frame(h, bg="#161b22"); c.pack(side="right", padx=20)
-        tk.Button(c, text="+ Add Camera", command=self._add_camera, bg="#238636", fg="white", relief="flat", padx=15).pack(side="left", padx=5)
-        tk.Button(c, text="Dashboard", command=open_dashboard, bg="#1f6feb", fg="white", relief="flat", padx=15).pack(side="left", padx=5)
-        tk.Button(c, text="Settings", command=open_settings, bg="#30363d", fg="white", relief="flat", padx=15).pack(side="left", padx=5)
-        self.grid = tk.Frame(self.root, bg="#0d1117"); self.grid.pack(fill="both", expand=True, padx=10, pady=10)
+        # ── Header bar ────────────────────────────────────────────────
+        hdr = tk.Frame(self.root, bg="#161b22", height=56)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
 
-    def _add_camera(self):
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Add Stream"); dlg.configure(bg="#0d1117")
-        dlg.geometry("420x185"); dlg.resizable(False, False)
-        dlg.attributes("-topmost", True); dlg.grab_set()
+        tk.Label(hdr, text="COMMAND CENTER",
+                 font=("Helvetica", 18, "bold"),
+                 bg="#161b22", fg="white").pack(side="left", padx=20)
 
-        tk.Label(dlg, text="Enter RTSP URL, device ID (0, 1), or pick a video file:",
-                 bg="#0d1117", fg="#c9d1d9", font=("Helvetica", 10),
-                 wraplength=380, justify="left").pack(padx=16, pady=(14, 6), anchor="w")
+        btn_cfg = dict(relief="flat", font=("Helvetica", 10, "bold"),
+                       padx=14, pady=4, cursor="hand2")
+        ctrl = tk.Frame(hdr, bg="#161b22"); ctrl.pack(side="right", padx=16)
 
-        entry_var = tk.StringVar()
-        row = tk.Frame(dlg, bg="#0d1117"); row.pack(fill="x", padx=16)
-        entry = tk.Entry(row, textvariable=entry_var, bg="#161b22", fg="white",
-                         insertbackground="white", relief="flat", font=("Helvetica", 11))
-        entry.pack(side="left", fill="x", expand=True, ipady=5)
+        tk.Button(ctrl, text="🎥  Webcam",
+                  command=lambda: self._open_source(0),
+                  bg="#238636", fg="white", **btn_cfg).pack(side="left", padx=4)
+        tk.Button(ctrl, text="📁  Open File",
+                  command=self._browse_file,
+                  bg="#1f6feb", fg="white", **btn_cfg).pack(side="left", padx=4)
+        tk.Button(ctrl, text="📡  RTSP / IP",
+                  command=self._prompt_rtsp,
+                  bg="#6e40c9", fg="white", **btn_cfg).pack(side="left", padx=4)
+        tk.Button(ctrl, text="⏹  Stop",
+                  command=self._stop_stream,
+                  bg="#b62324", fg="white", **btn_cfg).pack(side="left", padx=4)
 
-        def _browse():
-            path = askopenfilename(
-                parent=dlg, title="Select video file",
-                filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov"), ("All files", "*.*")])
-            if path: entry_var.set(path)
+        tk.Frame(ctrl, bg="#30363d", width=1, height=28).pack(side="left", padx=8)
 
-        tk.Button(row, text="Browse…", command=_browse,
-                  bg="#30363d", fg="white", relief="flat", padx=8).pack(side="left", padx=(6, 0))
+        tk.Button(ctrl, text="Dashboard",
+                  command=open_dashboard,
+                  bg="#30363d", fg="white", **btn_cfg).pack(side="left", padx=4)
+        tk.Button(ctrl, text="⚙ Settings",
+                  command=open_settings,
+                  bg="#30363d", fg="white", **btn_cfg).pack(side="left", padx=4)
 
-        def _confirm():
-            src = entry_var.get().strip()
-            if not src: dlg.destroy(); return
-            if src.isdigit(): src = int(src)
-            # Block a second webcam — only one integer (device) source allowed at a time
-            if isinstance(src, int):
-                already = [s for s in self.streams if isinstance(s.source, int)]
-                if already:
-                    dlg.destroy()
-                    messagebox.showwarning(
-                        "Webcam Already Active",
-                        f"Webcam (device {already[0].source}) is already running.\n"
-                        "Only one webcam is allowed at a time.\n\n"
-                        "Add an RTSP stream or video file instead.",
-                        parent=self.root)
-                    return
-            dlg.destroy()
-            cid = f"CAM-{len(self.streams) + 1}"
-            p = tk.Frame(self.grid, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
-            l = tk.Label(p, bg="black"); l.pack(fill="both", expand=True)
-            n = len(self.streams) + 1; cols = 2 if n > 1 else 1; rows = (n + 1) // 2
-            p.grid(row=(n-1)//cols, column=(n-1)%cols, sticky="nsew", padx=5, pady=5)
-            for i in range(rows): self.grid.grid_rowconfigure(i, weight=1)
-            for i in range(cols): self.grid.grid_columnconfigure(i, weight=1)
-            s = CameraStream(src, cid, l)
-            if s.start():
-                self.streams.append(s)
-            else:
-                p.destroy()
-                messagebox.showerror("Stream Error",
-                                     f"Could not open:\n{src}\n\nCheck the URL or file path.",
-                                     parent=self.root)
+        # ── Feed area ─────────────────────────────────────────────────
+        feed_frame = tk.Frame(self.root, bg="#0d1117")
+        feed_frame.pack(fill="both", expand=True, padx=10, pady=(6, 10))
 
-        btn_row = tk.Frame(dlg, bg="#0d1117"); btn_row.pack(pady=12)
-        tk.Button(btn_row, text="Connect", command=_confirm, bg="#238636", fg="white",
-                  relief="flat", font=("Helvetica", 11, "bold"), padx=16).pack(side="left", padx=6)
-        tk.Button(btn_row, text="Cancel", command=dlg.destroy,
-                  bg="#21262d", fg="#8b949e", relief="flat", padx=16).pack(side="left")
-        dlg.bind("<Return>", lambda e: _confirm())
-        entry.focus_set()
+        # Status bar
+        self.status_lbl = tk.Label(
+            feed_frame,
+            text="●  IDLE — open a source to begin",
+            font=("Helvetica", 10, "bold"),
+            bg="#1c2128", fg="#8b949e",
+            anchor="w", padx=12, pady=4
+        )
+        self.status_lbl.pack(fill="x", side="top")
+
+        # Video label
+        self.video_lbl = tk.Label(feed_frame, bg="#0d1117")
+        self.video_lbl.pack(fill="both", expand=True)
+
+    # ------------------------------------------------------------------
+    def _open_source(self, source):
+        self._stop_stream()
+        cid = "CAM-1" if isinstance(source, int) else "FILE"
+        self.stream = CameraStream(source, cid, self.video_lbl, self.status_lbl)
+        if not self.stream.start():
+            self.stream = None
+            messagebox.showerror(
+                "Stream Error",
+                f"Could not open source:\n{source}\n\nCheck the URL or device.",
+                parent=self.root)
+
+    def _browse_file(self):
+        path = askopenfilename(
+            parent=self.root,
+            title="Select video file",
+            filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov"), ("All files", "*.*")])
+        if path:
+            self._open_source(path)
+
+    def _prompt_rtsp(self):
+        url = simpledialog.askstring(
+            "RTSP / IP Camera",
+            "Enter RTSP URL or IP stream address:",
+            parent=self.root)
+        if url and url.strip():
+            self._open_source(url.strip())
+
+    def _stop_stream(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream = None
+        self.video_lbl.configure(image="")
+        self.status_lbl.configure(
+            text="●  STOPPED — open a source to begin",
+            bg="#1c2128", fg="#8b949e")
+
+    def _on_close(self):
+        self._stop_stream()
+        self.root.destroy()
+
 
 # Module-level placeholders — populated after tk.Tk() is created in __main__
 root = None
 _toggle_vars: dict = {k: None for k in DETECTION_TOGGLES}  # filled in __main__
 
 def open_settings():
-    win = tk.Toplevel(root); win.title("Settings"); win.configure(bg="#0d1117"); win.geometry("440x620")
+    win = tk.Toplevel(root); win.title("Settings"); win.configure(bg="#0d1117"); win.geometry("440x520")
     win.resizable(False, False); win.attributes("-topmost", True)
     tk.Label(win, text="Detection Toggles", font=("Helvetica", 13, "bold"), bg="#0d1117", fg="white").pack(pady=10)
-    tk.Label(win, text="Applies to all active camera streams", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
+    tk.Label(win, text="Applies to the active camera stream", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
     LABELS = {
         "WEAPON": "Weapon detection", "INTENT": "LSTM suspicious intent",
-        "POSE RULES": "Pose rules (raised arms, lunge…)", "FALL": "Fall detection",
+        "POSE RULES": "Pose rules (striking posture, lunge…)", "FALL": "Fall detection",
         "PERSON DOWN": "Person down (prone)", "RAPID MOVE": "Rapid movement",
         "FLAILING": "Arm flailing", "LOITERING": "Loitering", "PROXIMITY": "Proximity / conflict",
     }
@@ -496,17 +722,19 @@ def open_settings():
                            font=("Helvetica", 11), anchor="w",
                            command=lambda: save_settings(_toggle_vars)).pack(fill="x", padx=20, pady=2)
     tk.Label(win, text="Email Alert Config", font=("Helvetica", 13, "bold"), bg="#0d1117", fg="white").pack(pady=(14, 2))
-    tk.Label(win, text="Use a Gmail App Password", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
-    cfg = notifier.load_config(); entries = {}
-    for lbl, k, show in [("Sender Gmail", "sender_email", ""), ("App Password", "sender_password", "*"), ("Recipient", "recipient_email", "")]:
-        tk.Label(win, text=lbl, bg="#0d1117", fg="#c9d1d9", anchor="w").pack(fill="x", padx=20)
-        e = tk.Entry(win, bg="#161b22", fg="white", insertbackground="white", relief="flat", show=show)
-        e.insert(0, cfg.get(k, "")); e.pack(fill="x", padx=20, pady=2, ipady=4); entries[k] = e
+    tk.Label(win, text="Alerts sent from suspiciousactivity678@gmail.com", font=("Helvetica", 9), bg="#0d1117", fg="#8b949e").pack()
+    cfg = notifier.load_config()
+    tk.Label(win, text="Recipient Email", bg="#0d1117", fg="#c9d1d9", anchor="w").pack(fill="x", padx=20, pady=(8,0))
+    recipient_entry = tk.Entry(win, bg="#161b22", fg="white", insertbackground="white", relief="flat")
+    recipient_entry.insert(0, cfg.get("recipient_email", ""))
+    recipient_entry.pack(fill="x", padx=20, pady=2, ipady=4)
     def _save_email():
         nc = notifier.load_config()
-        for fk, ew in entries.items(): nc[fk] = ew.get().strip()
-        notifier.save_config(nc); messagebox.showinfo("Saved", "Email settings saved.", parent=win)
-    tk.Button(win, text="Save Email Settings", command=_save_email, bg="#238636", fg="white",
+        nc["recipient_email"] = recipient_entry.get().strip()
+        nc["enabled"] = True
+        notifier.save_config(nc)
+        messagebox.showinfo("Saved", "Recipient email saved. Alerts are now enabled.", parent=win)
+    tk.Button(win, text="Save", command=_save_email, bg="#238636", fg="white",
               relief="flat", font=("Helvetica", 11, "bold")).pack(pady=10)
     tk.Button(win, text="Close", command=win.destroy, bg="#21262d", fg="#8b949e", relief="flat").pack()
 
@@ -514,8 +742,8 @@ def open_dashboard(): LiveDashboard(root)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    # BooleanVar MUST be created after tk.Tk() root window exists
     saved = load_settings()
     _toggle_vars = {k: tk.BooleanVar(value=saved.get(k, v)) for k, v in DETECTION_TOGGLES.items()}
-    app = MultiStreamApp(root)
+    app = SurveillanceApp(root)
     root.mainloop()
+

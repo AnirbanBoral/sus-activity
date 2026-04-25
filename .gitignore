@@ -29,3 +29,6 @@ hybrid_pose_mobilenet_model.h5
 
 # Local logs
 *.log
+src/hybrid_pose_mobilenetv3_model.h5
+src/hybrid_pose_efficientnetb0_model.h5
+
